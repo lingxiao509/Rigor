@@ -68,7 +68,7 @@ input,select,textarea,button{font-family:inherit;outline:none}
   .modal{padding:30px}
   /* Two-column grids on desktop */
   .dash-series{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-  .dash-stats{grid-template-columns:repeat(4,1fr)!important}
+  .dash-stats{grid-template-columns:repeat(5,1fr)!important}
   .dash-pipe{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
   .detail-info{grid-template-columns:1fr 1fr 1fr 1fr!important}
   .sub-cat-grid{grid-template-columns:repeat(3,1fr)!important}
@@ -491,10 +491,10 @@ function removeCat(seriesId,catName){
 
 // ═══ DASHBOARD ═══
 function rDash(){
-  const sn=items.filter(d=>d.t==="正常").length,sl=items.filter(d=>d.t==="低库存").length,so=items.filter(d=>d.t==="缺货").length,sr2=items.filter(d=>d.t==="研发中").length;
+  const sn=items.filter(d=>d.t==="正常").length,sl=items.filter(d=>d.t==="低库存").length,so=items.filter(d=>d.t==="缺货").length,sr2=items.filter(d=>d.t==="研发中").length,sp=items.filter(d=>d.t==="待处理").length;
   let h=`<div style="padding:20px"><div style="display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:20px"><div style="width:56px;height:56px;border-radius:14px;background:#fff;display:flex;align-items:center;justify-content:center;padding:5px"><img src="${LOGO_URL}" style="width:100%;height:100%;object-fit:contain"></div><div style="text-align:center"><div style="font-size:20px;font-weight:700;color:#fff">Rigor库存管理系统</div><div style="font-size:13px;color:#6b7280">${items.length} SKU · ${sbConnected?`<span style="color:#34d399">☁ 实时同步</span>`:(lastSync?`<span style="color:#fbbf24">本地</span>`:"")}</div></div></div>`;
   h+=`<div class="dash-stats" style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:18px">`;
-  [{l:"正常",v:sn,c:"#34d399"},{l:"低库存",v:sl,c:"#fbbf24"},{l:"缺货",v:so,c:"#f87171"},{l:"研发中",v:sr2,c:"#c084fc"}].forEach(x=>{h+=`<div class="card" style="cursor:pointer" onclick="jumpToStatus('${x.l}')"><div style="font-size:11px;color:#6b7280">${x.l}</div><div style="font-size:24px;font-weight:700;color:${x.c}">${x.v}</div></div>`;});
+  [{l:"正常",v:sn,c:"#34d399"},{l:"低库存",v:sl,c:"#fbbf24"},{l:"缺货",v:so,c:"#f87171"},{l:"研发中",v:sr2,c:"#c084fc"},{l:"待处理",v:sp,c:"#a78bfa"}].forEach(x=>{h+=`<div class="card" style="cursor:pointer" onclick="jumpToStatus('${x.l}')"><div style="font-size:11px;color:#6b7280">${x.l}</div><div style="font-size:24px;font-weight:700;color:${x.c}">${x.v}</div></div>`;});
   h+=`</div>`;
   // Series
   h+=`<div style="font-size:15px;font-weight:600;color:#9ca3af;margin-bottom:10px">📦 产品系列</div>`;
@@ -676,7 +676,7 @@ function rList(){
   }
   if(!showSubCats){
     h+=`<div style="display:flex;gap:4px;margin-top:5px;flex-wrap:wrap">`;
-    ["全部","正常","低库存","缺货","研发中","待包装"].forEach(st=>{const g=gs(st==="全部"?"正常":st);h+=`<button onclick="stF='${st}';render()" style="font-size:10px;padding:2px 8px;border-radius:10px;border:none;background:${stF===st?g.b:"#1a1d27"};color:${stF===st?g.t:"#6b7280"};cursor:pointer">${st}</button>`;});
+    ["全部","正常","低库存","缺货","研发中","待包装","待处理"].forEach(st=>{const g=gs(st==="全部"?"正常":st);h+=`<button onclick="stF='${st}';render()" style="font-size:10px;padding:2px 8px;border-radius:10px;border:none;background:${stF===st?g.b:"#1a1d27"};color:${stF===st?g.t:"#6b7280"};cursor:pointer">${st}</button>`;});
     h+=`</div>`;
   }
   h+=`</div>`;
