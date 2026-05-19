@@ -269,14 +269,14 @@ function applySeriesSubs(subs){if(!subs)return;subs.forEach(ss=>{const sr=SERIES
 function saveState(){
   lastSync=new Date().toLocaleString("zh-CN");
   const seriesSubs=getSeriesSubs();
-  try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs,lastSync}));}catch(e){}
+  try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs,lastSync,shipNotes}));}catch(e){}
   if(sbConnected)pushToCloud();
 }
 
 function loadFromStorage(){
   try{
     const s=localStorage.getItem("RIGOR_INV");
-    if(s){const d=JSON.parse(s);items=d.items;allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";applySeriesSubs(d.seriesSubs);return true;}
+    if(s){const d=JSON.parse(s);items=d.items;allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";applySeriesSubs(d.seriesSubs);shipNotes=d.shipNotes||[];snNextId=shipNotes.length?Math.max(...shipNotes.map(n=>n.id))+1:1;return true;}
   }catch(e){}
   return false;
 }
@@ -376,6 +376,7 @@ if(!loadFromStorage()){
 let nextId=items.length?Math.max(...items.map(i=>i.id))+1:0;
 
 let V="dash",selId=null,srch="",serF="全部",stF="全部",subCatF="全部",ptab="all",modal=null,delMode=false;
+let shipNotes=[],snNextId=1,snDraft=null;
 window._composing=false;
 // Get all unique categories (dynamic)
 function getCats(){return[...new Set(items.map(d=>d.c))].sort();}
@@ -410,7 +411,10 @@ function render(){
   else if(V==="add")h=rAddEdit(null);
   else if(V==="edit")h=rAddEdit(items.find(i=>i.id===selId));
   else if(V==="sync")h=rSync();
-  h+=`<div class="nav">${[["dash","总览","◉"],["list","库存","☰"],["add","新增","＋"],["pipe","研发","🔬"],["sync","同步","☁"]].map(([id,l,i])=>`<button class="${V===id?"on":""}" onclick="nav('${id}')"><span style="font-size:16px">${i}</span><span>${l}</span></button>`).join("")}</div>`;
+  else if(V==="snlist")h=rSNList();
+  else if(V==="snform")h=rSNForm();
+  else if(V==="snview")h=rSNView();
+  h+=`<div class="nav">${[["dash","总览","◉"],["list","库存","☰"],["add","新增","＋"],["snlist","出库单","📋"],["pipe","研发","🔬"],["sync","同步","☁"]].map(([id,l,i])=>`<button class="${V===id||(id==="snlist"&&(V==="snform"||V==="snview"))?"on":""}" onclick="nav('${id}')"><span style="font-size:16px">${i}</span><span>${l}</span></button>`).join("")}</div>`;
   document.getElementById("app").innerHTML=h;
   bindSearchBox();
   saveState();
@@ -887,11 +891,29 @@ function doIO(){
   const d=items.find(i=>i.id===selId);if(!d)return;
   const qt=parseInt(document.getElementById("ioQty").value);if(!qt||qt<=0)return alert("请输入数量");
   const bt=document.getElementById("ioBat").value,dt=document.getElementById("ioDt").value;
+  const nt=document.getElementById("ioNt")?document.getElementById("ioNt").value:"";
   const pv=d.n,nx=modal.tp==="in"?d.n+qt:Math.max(0,d.n-qt);
   d.n=nx;d.t=nx===0?"缺货":nx<=5?"低库存":"正常";
   if(modal.tp==="in"&&bt){d.b=bt;d.eb=genExtBatch(d.c,bt,d.ln);}
-  d.logs.push({tp:modal.tp,qt,bt,dt,pv,nx,eb:d.eb});
+  d.logs.push({tp:modal.tp,qt,bt,dt,pv,nx,eb:d.eb,nt});
   allLogs.push({tp:modal.tp,qt,dt,nm:d.s+" "+d.c});
+  // After outbound, offer to generate shipping note
+  if(modal.tp==="out"){
+    modal=null;saveState();
+    const ov=document.createElement("div");ov.className="overlay";ov.id="snOv";
+    ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
+      <div style="font-size:40px;margin-bottom:12px">✅</div>
+      <div style="font-size:15px;font-weight:700;color:#fff;margin-bottom:8px">出库成功</div>
+      <div style="font-size:13px;color:#9ca3af;margin-bottom:6px">${d.s} ${d.c} × ${qt}</div>
+      <div style="font-size:12px;color:#6b7280;margin-bottom:20px">库存: ${pv} → ${nx}</div>
+      <div style="display:flex;gap:10px">
+        <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('snOv').remove();V='detail';render()">返回</button>
+        <button class="btn" style="background:#2563eb;flex:1" onclick="document.getElementById('snOv').remove();startSNFromIO(${d.id},${qt},'${bt}','${dt}')">生成出库单</button>
+      </div>
+    </div>`;
+    document.body.appendChild(ov);
+    return;
+  }
   modal=null;V="detail";render();
 }
 function updateIOExtBatch(){
@@ -899,6 +921,163 @@ function updateIOExtBatch(){
   const bt=document.getElementById("ioBat").value.trim();
   const el=document.getElementById("ioExtBat");if(!el)return;
   el.textContent=bt.length>=8?genExtBatch(d.c,bt,d.ln):"—";
+}
+
+// ═══ 出库单 SHIPPING NOTE MODULE ═══
+const COMPANY_INFO={name:"无锡瑞格生物科技有限责任公司",addr:"无锡市新吴区菱湖大道 97-1 兴业楼 D401/416",tel:"15061781186",web:"www.rigorscience.com"};
+function getCatName(c){
+  const map={"PS微球":"单分散聚苯乙烯微球","PMMA微球":"单分散PMMA微球","PET微球":"单分散PET微球","功能化PS微球":"功能化聚苯乙烯微球","PE微球":"聚乙烯微球","PP微球":"聚丙烯微球","PVC微球":"聚氯乙烯微球"};
+  return map[c]||c;
+}
+function startSNFromIO(itemId,qty,batch,dt){
+  const d=items.find(i=>i.id===itemId);if(!d)return;
+  const eb=d.eb||genExtBatch(d.c,d.b,d.ln);
+  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:dt||new Date().toISOString().slice(0,10),note:"纸质发票随货寄出，电子发票发到客户邮箱。\n运输费用由卖方承担",pack:"纸盒包装",lines:[{k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s,spec:"10ml 2.5wt%",unit:"瓶",qty}]};
+  V="snform";render();
+}
+function startNewSN(){
+  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:new Date().toISOString().slice(0,10),note:"纸质发票随货寄出，电子发票发到客户邮箱。\n运输费用由卖方承担",pack:"纸盒包装",lines:[{k:"",eb:"",name:"",spec:"10ml 2.5wt%",unit:"瓶",qty:1}]};
+  V="snform";render();
+}
+function rSNForm(){
+  if(!snDraft)return"";
+  let h=`<div style="padding:16px"><button onclick="V='dash';snDraft=null;render()" style="background:none;border:none;color:#6b7280;font-size:12px;cursor:pointer;margin-bottom:10px">← 返回</button>`;
+  h+=`<div style="font-size:17px;font-weight:700;color:#60a5fa;margin-bottom:14px">📋 创建出库单</div>`;
+  // Receiver info
+  h+=`<div class="card" style="cursor:default"><div style="font-size:13px;font-weight:600;color:#fbbf24;margin-bottom:8px">📦 收货信息</div>`;
+  h+=`<div class="form-row"><div class="form-label">收货人 *</div><input class="inp" id="sn_name" value="${snDraft.to_name}" placeholder="姓名"></div>`;
+  h+=`<div class="form-row"><div class="form-label">电话 *</div><input class="inp" id="sn_phone" value="${snDraft.to_phone}" placeholder="手机号"></div>`;
+  h+=`<div class="form-row"><div class="form-label">地址 *</div><textarea class="inp" id="sn_addr" rows="2" style="resize:vertical" placeholder="详细收货地址">${snDraft.to_addr}</textarea></div>`;
+  h+=`</div>`;
+  // Product lines
+  h+=`<div class="card" style="cursor:default"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><div style="font-size:13px;font-weight:600;color:#34d399">📦 发货明细</div><button class="sm" style="background:#059669;padding:4px 10px;font-size:11px" onclick="addSNLine()">+ 添加</button></div>`;
+  snDraft.lines.forEach((ln,idx)=>{
+    h+=`<div style="padding:10px;border:1px solid #1e2130;border-radius:8px;margin-bottom:8px;position:relative">`;
+    if(snDraft.lines.length>1)h+=`<button onclick="removeSNLine(${idx})" style="position:absolute;top:6px;right:8px;background:none;border:none;color:#f87171;font-size:16px;cursor:pointer">✕</button>`;
+    h+=`<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">`;
+    h+=`<div class="form-row"><div class="form-label">货号</div><input class="inp sn-f" data-idx="${idx}" data-key="k" value="${ln.k}" placeholder="如 PS01U003NA"></div>`;
+    h+=`<div class="form-row"><div class="form-label">批号</div><input class="inp sn-f" data-idx="${idx}" data-key="eb" value="${ln.eb}" placeholder="客户批号"></div>`;
+    h+=`</div>`;
+    h+=`<div class="form-row"><div class="form-label">产品名称</div><input class="inp sn-f" data-idx="${idx}" data-key="name" value="${ln.name}" placeholder="如 单分散聚苯乙烯微球 3um"></div>`;
+    h+=`<div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:6px">`;
+    h+=`<div class="form-row"><div class="form-label">规格</div><input class="inp sn-f" data-idx="${idx}" data-key="spec" value="${ln.spec}" placeholder="10ml 2.5wt%"></div>`;
+    h+=`<div class="form-row"><div class="form-label">单位</div><input class="inp sn-f" data-idx="${idx}" data-key="unit" value="${ln.unit}" placeholder="瓶"></div>`;
+    h+=`<div class="form-row"><div class="form-label">数量</div><input class="inp sn-f" data-idx="${idx}" data-key="qty" type="number" value="${ln.qty}"></div>`;
+    h+=`</div></div>`;
+  });
+  h+=`</div>`;
+  // Other info
+  h+=`<div class="card" style="cursor:default"><div style="font-size:13px;font-weight:600;color:#9ca3af;margin-bottom:8px">📝 其他信息</div>`;
+  h+=`<div class="form-row"><div class="form-label">外包装</div><input class="inp" id="sn_pack" value="${snDraft.pack}"></div>`;
+  h+=`<div class="form-row"><div class="form-label">发货日期</div><input class="inp" type="date" id="sn_dt" value="${snDraft.ship_dt}"></div>`;
+  h+=`<div class="form-row"><div class="form-label">备注</div><textarea class="inp" id="sn_note" rows="3" style="resize:vertical">${snDraft.note}</textarea></div>`;
+  h+=`</div>`;
+  h+=`<button class="btn" style="background:#2563eb" onclick="doSaveSN()">保存出库单</button>`;
+  h+=`</div>`;
+  return h;
+}
+function syncSNDraft(){
+  if(!snDraft)return;
+  const gv=id=>{const e=document.getElementById(id);return e?e.value:"";};
+  snDraft.to_name=gv("sn_name");snDraft.to_phone=gv("sn_phone");snDraft.to_addr=gv("sn_addr");
+  snDraft.pack=gv("sn_pack");snDraft.ship_dt=gv("sn_dt");snDraft.note=gv("sn_note");
+  document.querySelectorAll(".sn-f").forEach(el=>{
+    const idx=parseInt(el.dataset.idx),key=el.dataset.key;
+    if(snDraft.lines[idx])snDraft.lines[idx][key]=key==="qty"?parseInt(el.value)||1:el.value;
+  });
+}
+function addSNLine(){syncSNDraft();snDraft.lines.push({k:"",eb:"",name:"",spec:"10ml 2.5wt%",unit:"瓶",qty:1});render();}
+function removeSNLine(idx){syncSNDraft();snDraft.lines.splice(idx,1);render();}
+function doSaveSN(){
+  syncSNDraft();
+  if(!snDraft.to_name.trim())return alert("请填写收货人");
+  if(!snDraft.lines.length||!snDraft.lines[0].k.trim())return alert("请填写至少一行产品货号");
+  const sn={id:snNextId++,no:"SN"+new Date().toISOString().replace(/[-:T]/g,"").slice(0,14),created:new Date().toLocaleString("zh-CN"),...snDraft};
+  shipNotes.unshift(sn);snDraft=null;selId=sn.id;
+  saveState();V="snview";render();
+}
+function rSNList(){
+  let h=`<div style="padding:16px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><div style="font-size:17px;font-weight:700;color:#fff">📋 出库单列表</div><button class="sm" style="background:#2563eb;padding:6px 14px" onclick="startNewSN()">+ 新建</button></div>`;
+  if(!shipNotes.length){h+=`<div style="text-align:center;padding:40px 0;color:#4b5563">暂无出库单记录<br><span style="font-size:12px">出库时可选择生成，或点击上方"新建"创建</span></div>`;
+  }else{
+    shipNotes.forEach(sn=>{
+      h+=`<div class="item" onclick="selId=${sn.id};V='snview';render()">`;
+      h+=`<div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:8px"><span style="font-size:14px;font-weight:600;color:#fff">${sn.no}</span><span style="font-size:11px;color:#60a5fa">${sn.lines.length}项产品</span></div>`;
+      h+=`<div style="font-size:12px;color:#6b7280;margin-top:2px">${sn.to_name} · ${sn.to_phone||""}</div>`;
+      h+=`<div style="font-size:11px;color:#4b5563;margin-top:1px">${sn.ship_dt}</div></div>`;
+      h+=`<div style="color:#4b5563;font-size:18px">›</div></div>`;
+    });
+  }
+  h+=`</div>`;return h;
+}
+function rSNView(){
+  const sn=shipNotes.find(n=>n.id===selId);if(!sn)return"";
+  let h=`<div style="padding:16px"><button onclick="V='snlist';render()" style="background:none;border:none;color:#6b7280;font-size:12px;cursor:pointer;margin-bottom:10px">← 返回列表</button>`;
+  h+=`<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><div style="font-size:17px;font-weight:700;color:#60a5fa">📋 ${sn.no}</div><div style="display:flex;gap:6px"><button class="sm" style="background:#059669;padding:5px 12px" onclick="printSN(${sn.id})">🖨️ 打印</button><button class="sm" style="background:#dc2626;padding:5px 12px" onclick="delSN(${sn.id})">删除</button></div></div>`;
+  // Summary
+  h+=`<div class="card" style="cursor:default"><div style="font-size:12px;color:#6b7280;margin-bottom:2px">收货人</div><div style="font-size:15px;font-weight:600;color:#fff">${sn.to_name}  ${sn.to_phone}</div>`;
+  h+=`<div style="font-size:12px;color:#9ca3af;margin-top:4px">${sn.to_addr}</div></div>`;
+  // Lines
+  h+=`<div class="card" style="cursor:default"><div style="font-size:13px;font-weight:600;color:#34d399;margin-bottom:8px">发货明细 (${sn.lines.length}项)</div>`;
+  h+=`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px;color:#e5e7eb"><thead><tr style="border-bottom:1px solid #2a2e3e">`;
+  ["货号","批号","产品名称","规格","单位","数量"].forEach(th=>{h+=`<th style="padding:6px 8px;text-align:left;color:#6b7280;font-weight:500">${th}</th>`;});
+  h+=`</tr></thead><tbody>`;
+  sn.lines.forEach(ln=>{
+    h+=`<tr style="border-bottom:1px solid #151821"><td style="padding:6px 8px;font-family:monospace;color:#818cf8">${ln.k}</td><td style="padding:6px 8px;font-family:monospace">${ln.eb}</td><td style="padding:6px 8px">${ln.name}</td><td style="padding:6px 8px">${ln.spec}</td><td style="padding:6px 8px">${ln.unit}</td><td style="padding:6px 8px;font-weight:600">${ln.qty}</td></tr>`;
+  });
+  h+=`</tbody></table></div></div>`;
+  // Other
+  h+=`<div class="card" style="cursor:default"><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px">`;
+  h+=`<div><span style="color:#6b7280">发货日期：</span><span style="color:#e5e7eb">${sn.ship_dt}</span></div>`;
+  h+=`<div><span style="color:#6b7280">外包装：</span><span style="color:#e5e7eb">${sn.pack}</span></div>`;
+  h+=`</div>`;
+  if(sn.note)h+=`<div style="font-size:11px;color:#9ca3af;margin-top:8px;white-space:pre-wrap">${sn.note}</div>`;
+  h+=`<div style="font-size:10px;color:#4b5563;margin-top:8px;border-top:1px solid #1e2130;padding-top:6px">创建时间: ${sn.created}</div></div>`;
+  h+=`</div>`;return h;
+}
+function delSN(id){
+  const ov=document.createElement("div");ov.className="overlay";ov.id="delSnOv";
+  ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
+    <div style="font-size:40px;margin-bottom:12px">🗑️</div>
+    <div style="font-size:15px;font-weight:700;color:#f87171;margin-bottom:20px">确认删除此出库单？</div>
+    <div style="display:flex;gap:10px">
+      <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('delSnOv').remove()">取消</button>
+      <button class="btn" style="background:#dc2626;flex:1" onclick="document.getElementById('delSnOv').remove();shipNotes=shipNotes.filter(n=>n.id!==${id});saveState();V='snlist';render()">确认删除</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+}
+function printSN(id){
+  const sn=shipNotes.find(n=>n.id===id);if(!sn)return;
+  let rows="";sn.lines.forEach(ln=>{rows+=`<tr><td>${ln.k}</td><td>${ln.eb}</td><td>${ln.name}</td><td>${ln.spec}</td><td>${ln.unit}</td><td>${ln.qty}</td></tr>`;});
+  const html=`<!DOCTYPE html><html><head><meta charset="utf-8"><title>发货单 ${sn.no}</title><style>
+body{font-family:"Microsoft YaHei","SimSun",sans-serif;padding:40px;max-width:800px;margin:0 auto;color:#333}
+h1{text-align:center;font-size:22px;margin-bottom:24px;letter-spacing:4px}
+.info{margin-bottom:16px;font-size:13px;line-height:1.8}
+.info b{font-size:14px}
+table{width:100%;border-collapse:collapse;margin:16px 0;font-size:13px}
+th,td{border:1px solid #999;padding:8px 10px;text-align:left}
+th{background:#f0f0f0;font-weight:600}
+.footer{margin-top:24px;font-size:12px;color:#666;line-height:1.8}
+.sig{margin-top:30px;text-align:right;font-size:13px}
+@media print{body{padding:20px}button{display:none!important}}
+</style></head><body>
+<h1>发 货 单</h1>
+<div class="info"><b>发货信息:</b><br>${COMPANY_INFO.name}<br>地址: ${COMPANY_INFO.addr}<br>电话: ${COMPANY_INFO.tel}</div>
+<div class="info"><b>收货信息:</b><br>${sn.to_name}　${sn.to_phone}<br>${sn.to_addr}</div>
+<div style="font-size:14px;font-weight:600;margin-top:16px">发货明细:</div>
+<table><thead><tr><th>货号</th><th>批号</th><th>产品名称</th><th>规格</th><th>单位</th><th>数量</th></tr></thead><tbody>${rows}</tbody></table>
+<div class="footer">
+<p>交货时间：正式合同签订后，在收到买方 100%货款后有现货的 3 个工作日发货，定制产品按照约定时间发货。</p>
+<p>外包装: ${sn.pack}</p>
+<p>其他信息:<br>${(sn.note||"").replace(/\n/g,"<br>")}</p>
+<p>发货日期: ${sn.ship_dt.replace(/-/g," 年 ").replace(/ 年 /,(m,i)=>i===4?" 年 ":" 月 ")}日</p>
+<p style="margin-top:12px;font-size:11px;color:#888">请注意：此发货单应与原合同一同保存，并在收货后进行核对。如有任何问题，请及时与我们联系。</p>
+</div>
+<div class="sig">${COMPANY_INFO.name}<br>${COMPANY_INFO.web}</div>
+<div style="text-align:center;margin-top:30px"><button onclick="window.print()" style="padding:10px 30px;font-size:14px;cursor:pointer;border:1px solid #999;background:#fff;border-radius:4px">🖨️ 打印 / 保存PDF</button></div>
+</body></html>`;
+  const w=window.open("","_blank");w.document.write(html);w.document.close();
 }
 
 function toggleQC(id,qid){const d=items.find(i=>i.id===id);if(d){d.qc[qid]=!d.qc[qid];render();}}
