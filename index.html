@@ -414,7 +414,8 @@ function render(){
   else if(V==="snlist")h=rSNList();
   else if(V==="snform")h=rSNForm();
   else if(V==="snview")h=rSNView();
-  h+=`<div class="nav">${[["dash","总览","◉"],["list","库存","☰"],["add","新增","＋"],["snlist","出库单","📋"],["pipe","研发","🔬"],["sync","同步","☁"]].map(([id,l,i])=>`<button class="${V===id||(id==="snlist"&&(V==="snform"||V==="snview"))?"on":""}" onclick="nav('${id}')"><span style="font-size:16px">${i}</span><span>${l}</span></button>`).join("")}</div>`;
+  else if(V==="stats")h=rStats();
+  h+=`<div class="nav">${[["dash","总览","◉"],["list","库存","☰"],["add","新增","＋"],["snlist","出库单","📋"],["stats","统计","📊"],["pipe","研发","🔬"],["sync","同步","☁"]].map(([id,l,i])=>`<button class="${V===id||(id==="snlist"&&(V==="snform"||V==="snview"))?"on":""}" onclick="nav('${id}')"><span style="font-size:16px">${i}</span><span>${l}</span></button>`).join("")}</div>`;
   document.getElementById("app").innerHTML=h;
   bindSearchBox();
   saveState();
@@ -881,6 +882,7 @@ function rInOut(){
   const curExtB=d.eb||genExtBatch(d.c,d.b,d.ln);
   h+=`<div style="padding:8px 10px;border-radius:6px;background:#1e3a5f30;border:1px solid #2563eb30;margin-bottom:10px"><div style="font-size:10px;color:#60a5fa;margin-bottom:2px">🏷️ 对应客户批号</div><div id="ioExtBat" style="font-size:16px;font-weight:700;color:#fff;font-family:monospace;letter-spacing:1px">${curExtB||"—"}</div></div>`;
   h+=`<div class="form-row"><div class="form-label">日期</div><input class="inp" type="date" id="ioDt" value="${new Date().toISOString().slice(0,10)}"></div>`;
+  if(!isIn){h+=`<div class="form-row"><div class="form-label">出库用途 *</div><select class="inp" id="ioPurpose"><option value="淘宝">淘宝</option><option value="经销商">经销商</option><option value="海外客户">海外客户</option><option value="研发&生产">研发&生产</option><option value="其他">其他</option></select></div>`;}
   h+=`<div class="form-row"><div class="form-label">备注</div><textarea class="inp" id="ioNt" rows="2" style="resize:vertical"></textarea></div>`;
   h+=`<button class="btn" style="background:${cl}" onclick="doIO()">确认${isIn?"入库":"出库"}</button></div>`;
   return h;
@@ -892,11 +894,12 @@ function doIO(){
   const qt=parseInt(document.getElementById("ioQty").value);if(!qt||qt<=0)return alert("请输入数量");
   const bt=document.getElementById("ioBat").value,dt=document.getElementById("ioDt").value;
   const nt=document.getElementById("ioNt")?document.getElementById("ioNt").value:"";
+  const purpose=document.getElementById("ioPurpose")?document.getElementById("ioPurpose").value:"";
   const pv=d.n,nx=modal.tp==="in"?d.n+qt:Math.max(0,d.n-qt);
   d.n=nx;d.t=nx===0?"缺货":nx<=5?"低库存":"正常";
   if(modal.tp==="in"&&bt){d.b=bt;d.eb=genExtBatch(d.c,bt,d.ln);}
-  d.logs.push({tp:modal.tp,qt,bt,dt,pv,nx,eb:d.eb,nt});
-  allLogs.push({tp:modal.tp,qt,dt,nm:d.s+" "+d.c});
+  d.logs.push({tp:modal.tp,qt,bt,dt,pv,nx,eb:d.eb,nt,purpose});
+  allLogs.push({tp:modal.tp,qt,dt,nm:d.s+" "+d.c,purpose});
   // After outbound, offer to generate shipping note
   if(modal.tp==="out"){
     modal=null;saveState();
@@ -1268,6 +1271,132 @@ function confirmDisconnect(){
   if(sbPollTimer)clearInterval(sbPollTimer);
   sbConnected=false;sbClient=null;
   render();
+}
+
+// ═══ 出库统计 STATS MODULE ═══
+function rStats(){
+  const now=new Date();
+  const todayStr=now.toISOString().slice(0,10);
+  const weekAgo=new Date(now-7*864e5).toISOString().slice(0,10);
+  const monthStart=now.toISOString().slice(0,7)+"-01";
+  const yearStart=now.getFullYear()+"-01-01";
+
+  // Collect all outbound logs from all items
+  const outLogs=[];
+  items.forEach(d=>{
+    (d.logs||[]).forEach(lg=>{
+      if(lg.tp==="out"&&lg.dt){outLogs.push({...lg,item:d});}
+    });
+  });
+
+  // Time period stats
+  const todayOut=outLogs.filter(l=>l.dt===todayStr);
+  const weekOut=outLogs.filter(l=>l.dt>=weekAgo);
+  const monthOut=outLogs.filter(l=>l.dt>=monthStart);
+  const yearOut=outLogs.filter(l=>l.dt>=yearStart);
+  const sumQty=arr=>arr.reduce((s,l)=>s+(l.qt||0),0);
+
+  let h=`<div style="padding:16px"><div style="font-size:17px;font-weight:700;color:#fff;margin-bottom:14px">📊 出库统计</div>`;
+
+  // Summary cards
+  h+=`<div class="dash-stats" style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:16px">`;
+  [{l:"今日出库",v:sumQty(todayOut),n:todayOut.length,c:"#34d399"},{l:"本周出库",v:sumQty(weekOut),n:weekOut.length,c:"#60a5fa"},{l:"本月出库",v:sumQty(monthOut),n:monthOut.length,c:"#fbbf24"},{l:"全年出库",v:sumQty(yearOut),n:yearOut.length,c:"#c084fc"}].forEach(x=>{
+    h+=`<div class="card" style="cursor:default"><div style="font-size:11px;color:#6b7280">${x.l}</div><div style="font-size:24px;font-weight:700;color:${x.c}">${x.v}</div><div style="font-size:10px;color:#4b5563">${x.n} 次操作</div></div>`;
+  });
+  h+=`</div>`;
+
+  // Monthly trend (last 6 months bar chart)
+  h+=`<div class="card" style="cursor:default"><div style="font-size:13px;font-weight:600;color:#60a5fa;margin-bottom:12px">📈 月度出库趋势</div>`;
+  const monthMap={};
+  for(let i=5;i>=0;i--){
+    const d=new Date(now.getFullYear(),now.getMonth()-i,1);
+    const key=d.toISOString().slice(0,7);
+    const label=(d.getMonth()+1)+"月";
+    monthMap[key]={label,qty:0,count:0};
+  }
+  outLogs.forEach(l=>{const mk=l.dt.slice(0,7);if(monthMap[mk]){monthMap[mk].qty+=l.qt||0;monthMap[mk].count++;}});
+  const months=Object.values(monthMap);
+  const maxQ=Math.max(...months.map(m=>m.qty),1);
+  h+=`<div style="display:flex;align-items:flex-end;gap:8px;height:120px;padding:0 4px">`;
+  months.forEach(m=>{
+    const pct=Math.max(m.qty/maxQ*100,2);
+    h+=`<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px"><div style="font-size:11px;font-weight:600;color:#fff">${m.qty||""}</div><div style="width:100%;height:${pct}%;background:linear-gradient(180deg,#6366f1,#4f46e5);border-radius:4px 4px 0 0;min-height:2px"></div><div style="font-size:10px;color:#6b7280">${m.label}</div></div>`;
+  });
+  h+=`</div></div>`;
+
+  // Top products by outbound volume
+  h+=`<div class="card" style="cursor:default"><div style="font-size:13px;font-weight:600;color:#fbbf24;margin-bottom:10px">🏆 出库量排行 TOP 10</div>`;
+  const prodMap={};
+  outLogs.forEach(l=>{
+    const key=l.item.id;
+    if(!prodMap[key])prodMap[key]={item:l.item,qty:0,count:0};
+    prodMap[key].qty+=l.qt||0;prodMap[key].count++;
+  });
+  const topProds=Object.values(prodMap).sort((a,b)=>b.qty-a.qty).slice(0,10);
+  const topMax=topProds.length?topProds[0].qty:1;
+  if(!topProds.length){h+=`<div style="color:#4b5563;font-size:12px;text-align:center;padding:16px">暂无出库记录</div>`;}
+  else{topProds.forEach((p,i)=>{
+    const pct=p.qty/topMax*100;const sr=fs(p.item.c);
+    h+=`<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px"><div style="display:flex;align-items:center;gap:6px"><span style="font-size:11px;color:#4b5563;width:18px">#${i+1}</span><span style="font-size:12px;font-weight:600;color:#fff">${p.item.s}</span><span style="font-size:10px;color:${sr.color}">${p.item.c}</span></div><div style="font-size:12px;font-weight:700;color:#e5e7eb">${p.qty} <span style="color:#4b5563;font-weight:400">(${p.count}次)</span></div></div>`;
+    h+=`<div style="height:4px;background:#1e2130;border-radius:2px"><div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#f59e0b,#f97316);border-radius:2px"></div></div></div>`;
+  });}
+  h+=`</div>`;
+
+  // Purpose breakdown
+  h+=`<div class="card" style="cursor:default"><div style="font-size:13px;font-weight:600;color:#f472b6;margin-bottom:10px">🏷️ 出库用途分布</div>`;
+  const purpMap={};
+  const purpColors={"淘宝":"#f97316","经销商":"#60a5fa","海外客户":"#34d399","研发&生产":"#c084fc","其他":"#6b7280","未标记":"#374151"};
+  outLogs.forEach(l=>{const p=l.purpose||"未标记";if(!purpMap[p])purpMap[p]={qty:0,count:0};purpMap[p].qty+=l.qt||0;purpMap[p].count++;});
+  const purps=Object.entries(purpMap).sort((a,b)=>b[1].qty-a[1].qty);
+  const purpTotal=purps.reduce((s,p)=>s+p[1].qty,0)||1;
+  if(!purps.length){h+=`<div style="color:#4b5563;font-size:12px;text-align:center;padding:16px">暂无出库记录</div>`;}
+  else{
+    // Stacked bar
+    h+=`<div style="display:flex;height:24px;border-radius:6px;overflow:hidden;margin-bottom:12px">`;
+    purps.forEach(([p,v])=>{const pct=v.qty/purpTotal*100;h+=`<div style="width:${pct}%;background:${purpColors[p]||"#4b5563"};min-width:${pct>5?"0":"2px"}" title="${p}: ${v.qty}"></div>`;});
+    h+=`</div>`;
+    // Legend
+    purps.forEach(([p,v])=>{
+      const pct=(v.qty/purpTotal*100).toFixed(1);
+      h+=`<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #151821;font-size:12px"><div style="display:flex;align-items:center;gap:6px"><div style="width:10px;height:10px;border-radius:2px;background:${purpColors[p]||"#4b5563"}"></div><span style="color:#e5e7eb">${p}</span></div><div><span style="color:#fff;font-weight:600">${v.qty}</span> <span style="color:#4b5563">(${pct}% · ${v.count}次)</span></div></div>`;
+    });
+  }
+  h+=`</div>`;
+
+  // Shipping notes summary
+  if(shipNotes.length){
+    h+=`<div class="card" style="cursor:default"><div style="font-size:13px;font-weight:600;color:#34d399;margin-bottom:10px">📋 出库单统计</div>`;
+    h+=`<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">`;
+    const totalSNItems=shipNotes.reduce((s,sn)=>s+sn.lines.reduce((ss,ln)=>ss+(ln.qty||0),0),0);
+    h+=`<div style="text-align:center;padding:8px;background:#111318;border-radius:6px"><div style="font-size:18px;font-weight:700;color:#60a5fa">${shipNotes.length}</div><div style="font-size:10px;color:#6b7280">出库单数</div></div>`;
+    h+=`<div style="text-align:center;padding:8px;background:#111318;border-radius:6px"><div style="font-size:18px;font-weight:700;color:#34d399">${totalSNItems}</div><div style="font-size:10px;color:#6b7280">发货总量</div></div>`;
+    h+=`</div>`;
+    // Customer ranking
+    const custMap={};
+    shipNotes.forEach(sn=>{
+      const key=sn.to_name;
+      if(!custMap[key])custMap[key]={name:key,count:0,items:0};
+      custMap[key].count++;
+      custMap[key].items+=sn.lines.reduce((s,ln)=>s+(ln.qty||0),0);
+    });
+    const topCust=Object.values(custMap).sort((a,b)=>b.items-a.items).slice(0,5);
+    h+=`<div style="font-size:12px;font-weight:600;color:#9ca3af;margin-bottom:6px">客户发货排行</div>`;
+    topCust.forEach((c,i)=>{
+      h+=`<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #151821;font-size:12px"><div style="color:#e5e7eb">${i+1}. ${c.name}</div><div><span style="color:#60a5fa">${c.items}件</span> <span style="color:#4b5563">${c.count}单</span></div></div>`;
+    });
+    h+=`</div>`;
+  }
+
+  // Recent outbound log
+  h+=`<div class="card" style="cursor:default"><div style="font-size:13px;font-weight:600;color:#9ca3af;margin-bottom:10px">📝 最近出库记录</div>`;
+  const recent=outLogs.sort((a,b)=>b.dt.localeCompare(a.dt)).slice(0,15);
+  if(!recent.length){h+=`<div style="color:#4b5563;font-size:12px;text-align:center;padding:16px">暂无出库记录</div>`;}
+  else{recent.forEach(l=>{
+    const ptag=l.purpose?`<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:${purpColors[l.purpose]||"#374151"}20;color:${purpColors[l.purpose]||"#6b7280"}">${l.purpose}</span>`:"";
+    h+=`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #151821;font-size:12px"><div style="color:#e5e7eb">${l.item.s} <span style="color:#6b7280">${l.item.c}</span> ${ptag}</div><div><span style="color:#f87171;font-weight:600">-${l.qt}</span> <span style="color:#4b5563">${l.dt}</span></div></div>`;
+  });}
+  h+=`</div></div>`;
+  return h;
 }
 
 function rSync(){
