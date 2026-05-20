@@ -932,11 +932,11 @@ function getCatName(c){
 function startSNFromIO(itemId,qty,batch,dt){
   const d=items.find(i=>i.id===itemId);if(!d)return;
   const eb=d.eb||genExtBatch(d.c,d.b,d.ln);
-  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:dt||new Date().toISOString().slice(0,10),note:"纸质发票随货寄出，电子发票发到客户邮箱。\n运输费用由卖方承担",pack:"纸盒包装",lines:[{k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s,spec:"10ml 2.5wt%",unit:"瓶",qty}]};
+  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:dt||new Date().toISOString().slice(0,10),note:"",pack:"纸盒包装",lines:[{k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s,spec:"10ml 2.5wt%",unit:"瓶",qty}]};
   V="snform";render();
 }
 function startNewSN(){
-  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:new Date().toISOString().slice(0,10),note:"纸质发票随货寄出，电子发票发到客户邮箱。\n运输费用由卖方承担",pack:"纸盒包装",lines:[{k:"",eb:"",name:"",spec:"10ml 2.5wt%",unit:"瓶",qty:1}]};
+  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:new Date().toISOString().slice(0,10),note:"",pack:"纸盒包装",lines:[{k:"",eb:"",name:"",spec:"10ml 2.5wt%",unit:"瓶",qty:1}]};
   V="snform";render();
 }
 function rSNForm(){
@@ -954,6 +954,8 @@ function rSNForm(){
   snDraft.lines.forEach((ln,idx)=>{
     h+=`<div style="padding:10px;border:1px solid #1e2130;border-radius:8px;margin-bottom:8px;position:relative">`;
     if(snDraft.lines.length>1)h+=`<button onclick="removeSNLine(${idx})" style="position:absolute;top:6px;right:8px;background:none;border:none;color:#f87171;font-size:16px;cursor:pointer">✕</button>`;
+    // Search box
+    h+=`<div class="form-row" style="margin-bottom:8px"><div class="form-label" style="color:#60a5fa">🔍 搜索产品（输入粒径、货号或型号）</div><div style="position:relative"><input class="inp" id="snSrch_${idx}" placeholder="如 100nm, PS01, 3um 聚苯乙烯..." oninput="snSearch(${idx},this.value)" onfocus="snSearch(${idx},this.value)" style="border-color:#2563eb40"><div id="snDrop_${idx}" style="position:absolute;top:100%;left:0;right:0;z-index:50;max-height:200px;overflow-y:auto;background:#1a1d27;border:1px solid #2a2e3e;border-radius:8px;display:none"></div></div></div>`;
     h+=`<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">`;
     h+=`<div class="form-row"><div class="form-label">货号</div><input class="inp sn-f" data-idx="${idx}" data-key="k" value="${ln.k}" placeholder="如 PS01U003NA"></div>`;
     h+=`<div class="form-row"><div class="form-label">批号</div><input class="inp sn-f" data-idx="${idx}" data-key="eb" value="${ln.eb}" placeholder="客户批号"></div>`;
@@ -988,6 +990,34 @@ function syncSNDraft(){
 }
 function addSNLine(){syncSNDraft();snDraft.lines.push({k:"",eb:"",name:"",spec:"10ml 2.5wt%",unit:"瓶",qty:1});render();}
 function removeSNLine(idx){syncSNDraft();snDraft.lines.splice(idx,1);render();}
+function snSearch(idx,q){
+  const drop=document.getElementById("snDrop_"+idx);if(!drop)return;
+  if(!q||q.length<1){drop.style.display="none";return;}
+  const ql=q.toLowerCase();
+  const hits=items.filter(d=>{
+    const hay=(d.s+" "+d.c+" "+d.m+" "+d.k+" "+(d.f||"")).toLowerCase();
+    return hay.includes(ql);
+  }).slice(0,8);
+  if(!hits.length){drop.style.display="none";return;}
+  let dh="";
+  hits.forEach(d=>{
+    const sr=fs(d.c);
+    dh+=`<div onclick="snPickItem(${idx},${d.id})" style="padding:8px 10px;cursor:pointer;border-bottom:1px solid #151821;transition:background .1s" onmouseover="this.style.background='#2a2e3e'" onmouseout="this.style.background='transparent'">`;
+    dh+=`<div style="display:flex;align-items:center;gap:6px"><span style="font-size:13px;font-weight:600;color:#fff">${d.s}</span><span style="font-size:11px;color:${sr.color}">${d.c}</span></div>`;
+    dh+=`<div style="font-size:11px;color:#6b7280;margin-top:2px">${d.k||"—"} · ${d.m||""} · 批号: ${d.eb||d.b||"—"} · 库存: ${d.n}</div>`;
+    dh+=`</div>`;
+  });
+  drop.innerHTML=dh;drop.style.display="block";
+}
+function snPickItem(idx,itemId){
+  syncSNDraft();
+  const d=items.find(i=>i.id===itemId);if(!d||!snDraft)return;
+  const eb=d.eb||genExtBatch(d.c,d.b,d.ln);
+  snDraft.lines[idx]={k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s,spec:"10ml 2.5wt%",unit:"瓶",qty:snDraft.lines[idx].qty||1};
+  render();
+}
+// Close search dropdown when clicking outside
+document.addEventListener("click",e=>{if(!e.target.id||!e.target.id.startsWith("snSrch_")){document.querySelectorAll("[id^=snDrop_]").forEach(d=>{d.style.display="none";});}});
 function doSaveSN(){
   syncSNDraft();
   if(!snDraft.to_name.trim())return alert("请填写收货人");
