@@ -203,6 +203,9 @@ function getSBConfig(){
 }
 function saveSBConfig(cfg){localStorage.setItem(SB_KEY,JSON.stringify(cfg));}
 
+let _localDirty=false; // 本地有未上传的改动
+let _pushInFlight=false; // 正在上传中
+
 async function initSupabase(cfg){
   try{
     sbClient=supabase.createClient(cfg.url,cfg.anonKey);
@@ -214,53 +217,88 @@ async function initSupabase(cfg){
       sbConnected=false;return false;
     }
     sbConnected=true;
-    await pullFromCloud();
+    // 关键修复：重连时先合并本地离线改动，不能直接被云端覆盖
+    await reconcileOnConnect();
     if(sbPollTimer)clearInterval(sbPollTimer);
     sbPollTimer=setInterval(pollCloud,5000);
     return true;
   }catch(e){console.error("Supabase init error:",e);sbConnected=false;return false;}
 }
 
-async function pullFromCloud(){
+// 重连时的对账：比较云端和本地，如果本地有离线改动，以本地为准并推送
+async function reconcileOnConnect(){
   if(!sbClient)return;
   try{
-    const{data,error}=await sbClient.from("rigor_inventory").select("id,payload,updated_at").eq("data_key","main").limit(1).single();
+    const{data,error}=await sbClient.from("rigor_inventory").select("payload,updated_at").eq("data_key","main").limit(1).single();
+    const cloud=(data&&data.payload)?(typeof data.payload==="string"?JSON.parse(data.payload):data.payload):null;
+    const localCount=(items?items.length:0)+(shipNotes?shipNotes.length:0);
+    const cloudCount=cloud?((cloud.items?cloud.items.length:0)+(cloud.shipNotes?cloud.shipNotes.length:0)):0;
+    if(_localDirty||localCount>cloudCount){
+      // 本地有离线登记的新数据 → 以本地为准，推送到云端
+      await pushToCloud(true);
+      _localDirty=false;
+    }else if(cloud&&cloud.items){
+      // 云端数据更新 → 拉取
+      _lastSbUpdate=data.updated_at;
+      applyCloudData(cloud);
+    }
+  }catch(e){
+    // 云端还没有数据 → 把本地推上去
+    if(items&&items.length){await pushToCloud(true);_localDirty=false;}
+  }
+}
+
+function applyCloudData(d){
+  items=d.items;allLogs=d.logs||[];pipe=d.pipe||pipe;
+  shipNotes=d.shipNotes||shipNotes||[];
+  applySeriesSubs(d.seriesSubs);
+  lastSync="☁ "+new Date().toLocaleString("zh-CN");
+  nextId=items.length?Math.max(...items.map(i=>i.id))+1:0;
+  nextPipeId=pipe.length?Math.max(...pipe.map(p=>p.id))+1:1;
+  snNextId=shipNotes.length?Math.max(...shipNotes.map(n=>n.id))+1:1;
+  try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes}));}catch(e){}
+  render();
+}
+
+async function pullFromCloud(){
+  if(!sbClient)return;
+  // 有本地未上传改动或正在上传时，不覆盖本地
+  if(_localDirty||_pushInFlight)return;
+  try{
+    const{data,error}=await sbClient.from("rigor_inventory").select("payload,updated_at").eq("data_key","main").limit(1).single();
     if(error||!data)return;
     _lastSbUpdate=data.updated_at;
     const d=typeof data.payload==="string"?JSON.parse(data.payload):data.payload;
-    if(d&&d.items){
-      items=d.items;allLogs=d.logs||[];pipe=d.pipe||pipe;
-      applySeriesSubs(d.seriesSubs);
-      lastSync="☁ "+new Date().toLocaleString("zh-CN");
-      nextId=items.length?Math.max(...items.map(i=>i.id))+1:0;
-      nextPipeId=pipe.length?Math.max(...pipe.map(p=>p.id))+1:1;
-      try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync}));}catch(e){}
-      render();
-    }
+    if(d&&d.items)applyCloudData(d);
   }catch(e){console.error("Supabase pull error:",e);}
 }
 
 async function pollCloud(){
-  if(sbSaving||!sbConnected||!sbClient)return;
+  if(sbSaving||_pushInFlight||_localDirty||!sbConnected||!sbClient)return;
   try{
     const{data}=await sbClient.from("rigor_inventory").select("updated_at").eq("data_key","main").limit(1).single();
     if(data&&data.updated_at!==_lastSbUpdate){
-      _lastSbUpdate=data.updated_at;
       await pullFromCloud();
     }
   }catch(e){}
 }
 
-async function pushToCloud(){
+async function pushToCloud(force){
   if(!sbConnected||!sbClient)return;
-  sbSaving=true;
+  _pushInFlight=true;sbSaving=true;
   try{
-    const payload={items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync};
+    const payload={items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes};
     const{data,error}=await sbClient.from("rigor_inventory").upsert({data_key:"main",payload},{onConflict:"data_key"}).select("updated_at").single();
-    if(data)_lastSbUpdate=data.updated_at;
-    lastSync="☁ "+new Date().toLocaleString("zh-CN");
-  }catch(e){console.error("Supabase push error:",e);}
-  sbSaving=false;
+    if(error){
+      console.error("Supabase push error:",error);
+      _localDirty=true; // 上传失败，标记为待上传
+    }else{
+      if(data)_lastSbUpdate=data.updated_at;
+      lastSync="☁ "+new Date().toLocaleString("zh-CN");
+      _localDirty=false; // 上传成功
+    }
+  }catch(e){console.error("Supabase push error:",e);_localDirty=true;}
+  sbSaving=false;_pushInFlight=false;
 }
 
 function getSeriesSubs(){return SERIES.map(s=>({id:s.id,sub:s.sub}));}
@@ -269,6 +307,7 @@ function applySeriesSubs(subs){if(!subs)return;subs.forEach(ss=>{const sr=SERIES
 function saveState(){
   lastSync=new Date().toLocaleString("zh-CN");
   const seriesSubs=getSeriesSubs();
+  _localDirty=true; // 标记本地有新改动，防止被轮询覆盖
   try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs,lastSync,shipNotes}));}catch(e){}
   if(sbConnected)pushToCloud();
 }
@@ -391,13 +430,30 @@ function jumpToStatus(st){serF="全部";subCatF="全部";stF=st;V="list";delMode
 function toggleDelMode(){delMode=!delMode;render();}
 function copyPath(p){navigator.clipboard.writeText(p).then(()=>{});}
 
+// 把粒径规格转成纳米数值用于排序：nm→x1, um/μm→x1000, mm→x1000000
+function parseSizeNm(s){
+  if(!s)return 1e12; // 无粒径的排最后
+  const str=String(s).toLowerCase().replace(/μ/g,"u");
+  const m=str.match(/([\d.]+)\s*(nm|um|mm|ml|cm)?/);
+  if(!m)return 1e12;
+  const num=parseFloat(m[1]);if(isNaN(num))return 1e12;
+  const unit=m[2]||"nm";
+  const mult={nm:1,um:1000,mm:1e6,cm:1e7,ml:1e9}[unit]||1;
+  return num*mult;
+}
+
 function getFiltered(){
-  return items.filter(d=>{
+  const fl=items.filter(d=>{
     if(serF!=="全部"){const sr=SERIES.find(s=>s.id===serF);if(sr&&!sr.sub.includes(d.c))return false;}
     if(subCatF!=="全部"&&subCatF!=="__all__"&&d.c!==subCatF)return false;
     if(stF!=="全部"&&d.t!==stF)return false;
     if(srch){const q=srch.toLowerCase();return[d.s,d.m,d.k,d.f,d.c,d.o,d.b].some(v=>v&&v.toLowerCase().includes(q));}
     return true;
+  });
+  // 先按分类分组，同分类内按粒径从小到大排列
+  return fl.sort((a,b)=>{
+    if(a.c!==b.c)return a.c.localeCompare(b.c,"zh");
+    return parseSizeNm(a.s)-parseSizeNm(b.s);
   });
 }
 
