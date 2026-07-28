@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RIGOR 数据抢救工具</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0c0d12;color:#e5e7eb;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:20px;line-height:1.6}
+.wrap{max-width:720px;margin:0 auto}
+h1{font-size:22px;color:#fff;margin-bottom:4px}
+.sub{font-size:13px;color:#6b7280;margin-bottom:20px}
+.card{background:#151821;border:1px solid #2a2e3e;border-radius:12px;padding:16px;margin-bottom:14px}
+.card h2{font-size:14px;font-weight:600;margin-bottom:12px}
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}
+.box{background:#111318;border-radius:8px;padding:12px;text-align:center}
+.box .n{font-size:26px;font-weight:700}
+.box .l{font-size:11px;color:#6b7280;margin-top:2px}
+.btn{display:block;width:100%;padding:13px;border:none;border-radius:9px;font-size:15px;font-weight:600;cursor:pointer;color:#fff;margin-top:10px;font-family:inherit}
+.b-green{background:#059669}.b-blue{background:#2563eb}.b-gray{background:#374151}
+.warn{background:#3f1d1d;border:1px solid #7f1d1d;border-radius:9px;padding:13px;font-size:13px;color:#fca5a5;margin-bottom:16px}
+.ok{background:#052e26;border:1px solid #065f46;color:#6ee7b7}
+.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1e2130;font-size:13px}
+.row:last-child{border:none}
+.k{color:#6b7280}.v{color:#e5e7eb;font-weight:500}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+.hint{font-size:12px;color:#6b7280;margin-top:8px;padding:9px;background:#111318;border-radius:7px;line-height:1.7}
+.big{font-size:15px;color:#fbbf24;font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🚑 RIGOR 数据抢救工具</h1>
+  <div class="sub">读取本机浏览器里保存的库存数据 · 只读，不会修改或上传任何数据</div>
+
+  <div class="warn" id="topWarn">
+    请确认这个页面的网址，和你平时用的库存系统<b>在同一个域名下</b>（例如都是 xxx.github.io/rigor-inventory/），否则读不到数据。
+  </div>
+
+  <div id="result"></div>
+
+  <div class="card">
+    <h2>📖 使用说明</h2>
+    <div class="hint">
+      <b>1.</b> 每一台用过库存系统的电脑/手机，都用同一个浏览器打开这个页面<br>
+      <b>2.</b> 看下面显示的数据量和保存时间，<b>记下哪台设备的数据最完整</b><br>
+      <b>3.</b> 在数据最完整的那台设备上，点「导出这份数据」下载 JSON 文件<br>
+      <b>4.</b> 回到库存系统 →「☁ 同步」页 →「📥 导入 JSON」选择这个文件<br>
+      <b>5.</b> 导入后再点「⬆ 本地覆盖云端」，把正确数据推上去
+    </div>
+  </div>
+</div>
+
+<script>
+function fmt(ts){
+  if(!ts)return "（无记录）";
+  try{return new Date(ts).toLocaleString("zh-CN");}catch(e){return String(ts);}
+}
+function human(bytes){
+  if(bytes<1024)return bytes+" B";
+  if(bytes<1048576)return (bytes/1024).toFixed(1)+" KB";
+  return (bytes/1048576).toFixed(2)+" MB";
+}
+
+function scan(){
+  const out=document.getElementById("result");
+  let raw=null;
+  try{raw=localStorage.getItem("RIGOR_INV");}catch(e){
+    out.innerHTML=`<div class="warn">无法读取浏览器存储：${e.message}<br>可能是隐私模式或浏览器设置限制。</div>`;return;
+  }
+  if(!raw){
+    out.innerHTML=`<div class="warn"><span class="big">本机没有找到库存数据</span><br><br>
+      可能原因：<br>
+      • 这个页面和库存系统不在同一个网址下（最常见）<br>
+      • 这台设备从没打开过库存系统<br>
+      • 用了不同的浏览器（Chrome 和 Edge 的数据不互通）<br>
+      • 浏览器缓存/网站数据被清理过<br><br>
+      请换其他设备或其他浏览器再试。</div>`;
+    return;
+  }
+
+  let d=null;
+  try{d=JSON.parse(raw);}catch(e){
+    out.innerHTML=`<div class="warn">数据已损坏，无法解析：${e.message}</div>
+      <div class="card"><h2>原始内容（前 500 字，可复制保存）</h2>
+      <div class="mono" style="word-break:break-all;color:#9ca3af">${raw.slice(0,500).replace(/</g,"&lt;")}</div></div>`;
+    return;
+  }
+
+  const items=Array.isArray(d.items)?d.items:[];
+  const shipNotes=Array.isArray(d.shipNotes)?d.shipNotes:[];
+  const customers=Array.isArray(d.customers)?d.customers:[];
+  const pipe=Array.isArray(d.pipe)?d.pipe:[];
+  const allLogs=Array.isArray(d.logs)?d.logs:[];
+
+  let ioCount=0,attCount=0,stockSum=0,withBatch=0;
+  items.forEach(i=>{
+    ioCount+=(i.logs&&i.logs.length)||0;
+    attCount+=(i.att&&i.att.length)||0;
+    stockSum+=(i.n||0);
+    if(i.b)withBatch++;
+  });
+
+  document.getElementById("topWarn").className="warn ok";
+  document.getElementById("topWarn").innerHTML="✅ 已成功读取到本机数据，详情见下方";
+
+  let h=`<div class="card"><h2 style="color:#34d399">📦 本机数据概况</h2>
+    <div class="stat">
+      <div class="box"><div class="n" style="color:#60a5fa">${items.length}</div><div class="l">产品条目</div></div>
+      <div class="box"><div class="n" style="color:#fbbf24">${ioCount}</div><div class="l">出入库记录</div></div>
+      <div class="box"><div class="n" style="color:#34d399">${shipNotes.length}</div><div class="l">出库单</div></div>
+      <div class="box"><div class="n" style="color:#c084fc">${customers.length}</div><div class="l">客户档案</div></div>
+    </div>
+    <div style="margin-top:14px">
+      <div class="row"><span class="k">最后保存时间</span><span class="v">${fmt(d.savedAt)}</span></div>
+      <div class="row"><span class="k">系统内记录的同步时间</span><span class="v">${d.lastSync||"（无）"}</span></div>
+      <div class="row"><span class="k">库存数量合计</span><span class="v">${stockSum}</span></div>
+      <div class="row"><span class="k">有批号的产品</span><span class="v">${withBatch} 条</span></div>
+      <div class="row"><span class="k">附件记录</span><span class="v">${attCount} 条</span></div>
+      <div class="row"><span class="k">研发项目</span><span class="v">${pipe.length} 条</span></div>
+      <div class="row"><span class="k">数据体积</span><span class="v">${human(raw.length)}</span></div>
+    </div>
+    <button class="btn b-green" onclick="doExport()">💾 导出这份数据（JSON 备份）</button>
+    <div class="hint">导出后请妥善保存，这是恢复数据的唯一依据。建议同时发一份到微信/邮箱备份。</div>
+  </div>`;
+
+  // 出库单明细
+  if(shipNotes.length){
+    h+=`<div class="card"><h2 style="color:#34d399">📋 出库单清单（${shipNotes.length} 张）</h2>`;
+    shipNotes.slice(0,25).forEach(sn=>{
+      const qty=(sn.lines||[]).reduce((s,l)=>s+(l.qty||0),0);
+      h+=`<div class="row"><span class="v">${sn.no||"—"} · ${sn.to_name||"—"}</span><span class="k">${sn.ship_dt||""} · ${qty}件</span></div>`;
+    });
+    if(shipNotes.length>25)h+=`<div class="hint">仅显示前 25 张，导出文件包含全部</div>`;
+    h+=`</div>`;
+  }
+
+  // 最近出入库
+  const recent=[];
+  items.forEach(i=>(i.logs||[]).forEach(lg=>recent.push({...lg,nm:(i.s||"")+" "+(i.c||"")})));
+  recent.sort((a,b)=>String(b.dt||"").localeCompare(String(a.dt||"")));
+  if(recent.length){
+    h+=`<div class="card"><h2 style="color:#fbbf24">📝 最近出入库记录（共 ${recent.length} 条）</h2>`;
+    recent.slice(0,20).forEach(lg=>{
+      const isIn=lg.tp==="in";
+      h+=`<div class="row"><span class="v">${lg.nm}</span><span style="color:${isIn?"#34d399":"#f87171"}">${isIn?"入库 +":"出库 -"}${lg.qt} <span class="k">${lg.dt||""}</span></span></div>`;
+    });
+    if(recent.length>20)h+=`<div class="hint">仅显示最近 20 条，导出文件包含全部</div>`;
+    h+=`</div>`;
+  }
+
+  h+=`<div class="card"><h2>🔍 其他浏览器也检查一下</h2>
+    <div class="hint">数据是按「浏览器」分开存的。如果这台电脑上还装了别的浏览器（Chrome / Edge / 火狐 / 360），
+    请<b>用每个浏览器都打开一次这个页面</b>，可能其中一个存着更完整的数据。手机浏览器同理。</div></div>`;
+
+  out.innerHTML=h;
+  window._rescueData=d;
+}
+
+function doExport(){
+  const d=window._rescueData;if(!d)return;
+  const dev=(navigator.userAgent.match(/(Windows|Mac|iPhone|Android|iPad)/)||["设备"])[0];
+  const stamp=new Date().toISOString().slice(0,16).replace(/[-:T]/g,"");
+  const blob=new Blob([JSON.stringify(d,null,2)],{type:"application/json"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=`RIGOR抢救备份_${dev}_${stamp}.json`;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+
+scan();
+</script>
+</body>
+</html>
