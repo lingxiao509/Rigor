@@ -209,6 +209,8 @@ function saveSBConfig(cfg){localStorage.setItem(SB_KEY,JSON.stringify(cfg));}
 // ── 版本号防丢机制 ──
 // 每次本地改动 _localVer++。推送时记录推送的版本号，只有推送成功且期间没有新改动
 // (_localVer 未变) 才认为"干净"。任何一次成功推送都不会误清掉更新的改动。
+let _savedAt=0;         // 最后一次保存的时间戳，用于重连对账
+let _lastFingerprint="";// 兜底自动保存的基线快照
 let _localVer=0;        // 本地改动版本号，每次 saveState 递增
 let _syncedVer=0;       // 已成功同步到云端的版本号
 let _pushInFlight=false;// 正在上传
@@ -232,24 +234,43 @@ async function initSupabase(cfg){
   }catch(e){console.error("Supabase init error:",e);sbConnected=false;return false;}
 }
 
-// 重连对账：本地有未同步改动就以本地为准推送，否则拉取云端
+// 重连对账：用「保存时间戳」判断谁更新，而不是数量（数量识别不了库存/出入库变化）
 async function reconcileOnConnect(){
   if(!sbClient)return;
   try{
     const{data,error}=await sbClient.from("rigor_inventory").select("payload,updated_at").eq("data_key","main").limit(1).single();
     const cloud=(data&&data.payload)?(typeof data.payload==="string"?JSON.parse(data.payload):data.payload):null;
-    const localCount=(items?items.length:0)+(shipNotes?shipNotes.length:0);
-    const cloudCount=cloud?((cloud.items?cloud.items.length:0)+(cloud.shipNotes?cloud.shipNotes.length:0)):0;
-    // 本地有未同步改动，或本地数据比云端多（离线登记过）→ 以本地为准
-    if(isDirty()||localCount>cloudCount){
+    if(!cloud||!cloud.items){await pushToCloud();return;}
+    const cloudAt=cloud.savedAt||0;
+    const localAt=getLocalSavedAt();
+    // 本地有未同步改动 → 一定以本地为准
+    if(isDirty()){await pushToCloud();return;}
+    // 比较保存时间：本地更新就推上去，云端更新就拉下来
+    if(localAt>cloudAt){
       await pushToCloud();
-    }else if(cloud&&cloud.items){
+    }else if(cloudAt>localAt){
       _lastSbUpdate=data.updated_at;
       applyCloudData(cloud);
+    }else{
+      // 时间戳一样（或都没有）→ 用数据丰富度兜底，多的一方胜出
+      if(richness(localSnapshot())>richness(cloud))await pushToCloud();
+      else{_lastSbUpdate=data.updated_at;applyCloudData(cloud);}
     }
   }catch(e){
     if(items&&items.length)await pushToCloud();
   }
+}
+// 数据丰富度：产品数 + 出入库记录总数 + 出库单 + 客户，用于时间戳缺失时兜底
+function richness(d){
+  if(!d)return -1;
+  const its=d.items||[];
+  const logCnt=its.reduce((s,i)=>s+((i.logs&&i.logs.length)||0),0);
+  return its.length+logCnt*2+((d.shipNotes||[]).length*3)+((d.customers||[]).length)+((d.logs||[]).length);
+}
+function localSnapshot(){return{items,logs:allLogs,shipNotes,customers};}
+function getLocalSavedAt(){
+  try{const s=localStorage.getItem("RIGOR_INV");if(s)return JSON.parse(s).savedAt||0;}catch(e){}
+  return 0;
 }
 
 function applyCloudData(d){
@@ -264,7 +285,9 @@ function applyCloudData(d){
   custNextId=customers.length?Math.max(...customers.map(c=>c.id||0))+1:1;
   // 云端数据被采纳，本地与云端一致
   _syncedVer=_localVer;
-  try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers}));}catch(e){}
+  _savedAt=d.savedAt||Date.now();
+  try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers,savedAt:_savedAt}));}catch(e){}
+  _lastFingerprint=fingerprint();
   render();
 }
 
@@ -299,7 +322,7 @@ async function pushToCloud(){
   _pushInFlight=true;sbSaving=true;
   const verAtPush=_localVer; // 记录本次上传对应的版本
   try{
-    const payload={items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers};
+    const payload={items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers,savedAt:_savedAt||Date.now()};
     const{data,error}=await sbClient.from("rigor_inventory").upsert({data_key:"main",payload},{onConflict:"data_key"}).select("updated_at").single();
     if(error){
       console.error("Supabase push error:",error);
@@ -323,9 +346,44 @@ function saveState(){
   lastSync=new Date().toLocaleString("zh-CN");
   const seriesSubs=getSeriesSubs();
   _localVer++; // 每次改动版本号+1，标记为脏
-  try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs,lastSync,shipNotes,customers}));}catch(e){}
+  _savedAt=Date.now();
+  try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs,lastSync,shipNotes,customers,savedAt:_savedAt}));}catch(e){}
+  _lastFingerprint=fingerprint(); // 更新兜底快照基线
   if(sbConnected)pushToCloud();
 }
+
+// ── 兜底自动保存 ──
+// 万一某个操作路径漏了 saveState，这里每 2 秒对比一次数据指纹，
+// 发现有变化就自动保存，确保任何改动都不会丢失。
+function fingerprint(){
+  try{
+    return items.length+"|"+
+      items.reduce((s,i)=>s+(i.n||0),0)+"|"+
+      items.reduce((s,i)=>s+((i.logs&&i.logs.length)||0),0)+"|"+
+      items.reduce((s,i)=>s+((i.att&&i.att.length)||0),0)+"|"+
+      items.map(i=>i.k+i.b+i.t+(i.pr||"")).join("").length+"|"+
+      allLogs.length+"|"+shipNotes.length+"|"+customers.length+"|"+(pipe?pipe.length:0);
+  }catch(e){return "";}
+}
+setInterval(()=>{
+  if(_pushInFlight)return;
+  const fp=fingerprint();
+  if(fp&&_lastFingerprint&&fp!==_lastFingerprint){
+    console.log("[兜底保存] 检测到未保存的改动，自动保存");
+    saveState();
+  }else if(fp&&!_lastFingerprint){
+    _lastFingerprint=fp;
+  }
+},2000);
+// 关闭页面前保底存一次本地
+window.addEventListener("beforeunload",()=>{
+  try{
+    const fp=fingerprint();
+    if(fp!==_lastFingerprint){
+      localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers,savedAt:Date.now()}));
+    }
+  }catch(e){}
+});
 
 function loadFromStorage(){
   let d=null;
@@ -336,7 +394,7 @@ function loadFromStorage(){
   }catch(e){console.error("读取本地数据失败:",e);return false;}
   if(!d||!d.items||!Array.isArray(d.items))return false;
   // 核心数据先加载
-  items=d.items;allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";
+  items=d.items;allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";_savedAt=d.savedAt||0;
   // 可选字段单独容错，任何一个出错都不影响主数据
   try{applySeriesSubs(d.seriesSubs);}catch(e){console.error("分类恢复失败:",e);}
   try{
@@ -883,7 +941,7 @@ function doAdd(){
   items.push(newItem);
   const sr=fs(data.c);
   if(!sr.sub.includes(data.c)){SERIES[0].sub.push(data.c);}
-  selId=newItem.id;V="detail";render();
+  selId=newItem.id;saveState();V="detail";render();
 }
 
 function doEdit(id){
@@ -894,7 +952,7 @@ function doEdit(id){
   if(!data.eb&&data.b)data.eb=genExtBatch(data.c,data.b,data.ln);
   Object.assign(d,data);d.q=String(data.n);
   if(!fs(data.c).sub.includes(data.c)){SERIES[0].sub.push(data.c);}
-  V="detail";render();
+  saveState();V="detail";render();
 }
 
 function doDelete(id){
@@ -915,7 +973,7 @@ function doDelete(id){
 function confirmDelete(id){
   document.getElementById("delOv").remove();
   items=items.filter(i=>i.id!==id);
-  V="list";selId=null;render();
+  saveState();V="list";selId=null;render();
 }
 
 // ═══ DETAIL ═══
@@ -1012,7 +1070,7 @@ function doIO(){
     document.body.appendChild(ov);
     return;
   }
-  modal=null;V="detail";render();
+  modal=null;saveState();V="detail";render();
 }
 function updateIOExtBatch(){
   const d=items.find(i=>i.id===selId);if(!d)return;
@@ -1326,8 +1384,8 @@ th{background:#f0f0f0;font-weight:600}
   const w=window.open("","_blank");w.document.write(html);w.document.close();
 }
 
-function toggleQC(id,qid){const d=items.find(i=>i.id===id);if(d){d.qc[qid]=!d.qc[qid];render();}}
-function setPrio(id,pr){const d=items.find(i=>i.id===id);if(d){d.pr=pr;render();}}
+function toggleQC(id,qid){const d=items.find(i=>i.id===id);if(d){d.qc[qid]=!d.qc[qid];saveState();render();}}
+function setPrio(id,pr){const d=items.find(i=>i.id===id);if(d){d.pr=pr;saveState();render();}}
 
 function openAttach(id){
   const d=items.find(i=>i.id===id);if(!d)return;const fp=makePath(d);
@@ -1357,9 +1415,9 @@ function addAtt(id){
   const nm=document.getElementById("attNm").value.trim();if(!nm)return;
   const d=items.find(i=>i.id===id);
   d.att.push({aid:Date.now(),tp:window._at.id,dir:window._at.dir,nm,dt:new Date().toISOString().slice(0,10)});
-  document.getElementById("attOv").remove();render();
+  document.getElementById("attOv").remove();saveState();render();
 }
-function delAtt(id,aid){const d=items.find(i=>i.id===id);d.att=d.att.filter(a=>a.aid!==aid);render();}
+function delAtt(id,aid){const d=items.find(i=>i.id===id);d.att=d.att.filter(a=>a.aid!==aid);saveState();render();}
 
 // ═══ PIPELINE ═══
 let pipeEditId=null; // null=list, -1=new, else=editing id
@@ -1415,14 +1473,14 @@ function getPipeForm(){
 function doAddPipe(){
   const d=getPipeForm();if(!d)return;
   pipe.push({id:nextPipeId++,...d});
-  pipeEditId=null;render();
+  saveState();pipeEditId=null;render();
 }
 
 function doEditPipe(id){
   const d=getPipeForm();if(!d)return;
   const p=pipe.find(x=>x.id===id);if(!p)return;
   Object.assign(p,d);
-  pipeEditId=null;render();
+  saveState();pipeEditId=null;render();
 }
 
 function delPipe(id){
@@ -1443,7 +1501,7 @@ function delPipe(id){
 function confirmDelPipe(id){
   document.getElementById("delPipeOv").remove();
   pipe=pipe.filter(p=>p.id!==id);
-  render();
+  saveState();render();
 }
 
 function cyclePipe(pid){const p=pipe.find(x=>x.id===pid);if(!p)return;const c={"待启动":"进行中","进行中":"已完成","已完成":"待启动","待包装":"已完成"};p.st=c[p.st]||"进行中";render();}
@@ -1465,6 +1523,42 @@ async function saveSBConfigFromForm(){
     alert("连接失败，请检查配置信息，并确认已创建数据表。");
   }
 }
+// 手动解决数据冲突
+async function forcePush(){
+  if(!sbConnected)return alert("未连接云数据库");
+  _savedAt=Date.now();_localVer++;
+  await pushToCloud();
+  alert("已用本机数据覆盖云端\n产品 "+items.length+" 条 · 出库单 "+shipNotes.length+" 张 · 客户 "+customers.length+" 位");
+  render();
+}
+function forcePull(){
+  if(!sbConnected)return alert("未连接云数据库");
+  const ov=document.createElement("div");ov.className="overlay";ov.id="fpOv";
+  ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
+    <div style="font-size:40px;margin-bottom:12px">⚠️</div>
+    <div style="font-size:15px;font-weight:700;color:#f87171;margin-bottom:8px">用云端数据覆盖本机？</div>
+    <div style="font-size:12px;color:#9ca3af;margin-bottom:20px">本机未上传的改动将丢失，确认云端数据是最新的再操作</div>
+    <div style="display:flex;gap:10px">
+      <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('fpOv').remove()">取消</button>
+      <button class="btn" style="background:#dc2626;flex:1" onclick="doForcePull()">确认覆盖</button>
+    </div></div>`;
+  document.body.appendChild(ov);
+}
+async function doForcePull(){
+  document.getElementById("fpOv").remove();
+  _syncedVer=_localVer; // 清除脏标记，允许拉取
+  try{
+    const{data}=await sbClient.from("rigor_inventory").select("payload,updated_at").eq("data_key","main").limit(1).single();
+    if(data&&data.payload){
+      const d=typeof data.payload==="string"?JSON.parse(data.payload):data.payload;
+      if(d&&d.items){_lastSbUpdate=data.updated_at;applyCloudData(d);
+        alert("已从云端拉取\n产品 "+items.length+" 条 · 出库单 "+shipNotes.length+" 张 · 客户 "+customers.length+" 位");
+        return;}
+    }
+    alert("云端暂无数据");
+  }catch(e){alert("拉取失败: "+e.message);}
+}
+
 function disconnectSB(){
   const ov=document.createElement("div");ov.className="overlay";ov.id="discOv";
   ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
@@ -1667,7 +1761,9 @@ create policy "Allow all" on rigor_inventory for all using (true) with check (tr
     h+=`<div class="card" style="cursor:default;border-color:#059669"><div style="font-size:13px;font-weight:600;color:#34d399;margin-bottom:8px">✅ Supabase 已配置</div>`;
     h+=`<div style="font-size:11px;color:#9ca3af;margin-bottom:6px">你和同事打开同一个网址，数据每5秒自动同步。一方修改，另一方几秒后自动看到。</div>`;
     h+=`<div style="font-size:10px;color:#6b7280;margin-bottom:10px;padding:6px 8px;background:#111318;border-radius:6px">${getSBConfig().url||"—"}</div>`;
-    h+=`<div style="display:flex;gap:8px"><button class="btn" style="background:#059669;flex:1" onclick="pushToCloud().then(()=>alert('已推送到云端'))">手动同步</button><button class="btn" style="background:#374151;flex:1" onclick="disconnectSB()">断开连接</button></div></div>`;
+    h+=`<div style="display:flex;gap:8px;margin-bottom:8px"><button class="btn" style="background:#059669;flex:1" onclick="forcePush()">⬆ 本地覆盖云端</button><button class="btn" style="background:#1e3a5f;flex:1" onclick="forcePull()">⬇ 云端覆盖本地</button></div>`;
+    h+=`<div style="font-size:10px;color:#4b5563;margin-bottom:8px;padding:6px;background:#111318;border-radius:6px">数据对不上时用这两个按钮手动解决：确认本机数据是最新的就点「本地覆盖云端」，反之点「云端覆盖本地」</div>`;
+    h+=`<button class="btn" style="background:#374151" onclick="disconnectSB()">断开连接</button></div>`;
   }
 
   // Password management
