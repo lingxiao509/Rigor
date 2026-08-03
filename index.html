@@ -234,33 +234,116 @@ async function initSupabase(cfg){
   }catch(e){console.error("Supabase init error:",e);sbConnected=false;return false;}
 }
 
-// 重连对账：用「保存时间戳」判断谁更新，而不是数量（数量识别不了库存/出入库变化）
+// ═══ 合并式对账（不再是「一方覆盖另一方」）═══
+// 断网期间双方各自的出入库记录、出库单、客户都保留，库存按记录增量重算
+function logKey(lg,idx){
+  if(lg&&lg.uid)return lg.uid;
+  return "L"+idx+"_"+(lg&&lg.tp||"")+"_"+(lg&&lg.qt||0)+"_"+(lg&&lg.dt||"")+"_"+(lg&&lg.bt||"");
+}
+function itemKey(i){return (i.k&&String(i.k).trim())?("K:"+String(i.k).trim()):("I:"+i.id);}
+
+function mergeWithCloud(cloud){
+  // ── 产品 & 出入库记录 ──
+  const cMap={},lMap={};
+  (cloud.items||[]).forEach(i=>{cMap[itemKey(i)]=i;});
+  (items||[]).forEach(i=>{lMap[itemKey(i)]=i;});
+  const keys=[...new Set([...Object.keys(cMap),...Object.keys(lMap)])];
+  const merged=[];
+  let recovered=0;
+  keys.forEach(k=>{
+    const c=cMap[k],l=lMap[k];
+    if(c&&!l){merged.push(c);return;}
+    if(l&&!c){merged.push(l);recovered++;return;}
+    const cLogs=c.logs||[],lLogs=l.logs||[];
+    const cSet=new Set(cLogs.map((x,i)=>logKey(x,i)));
+    // 本地独有的出入库记录（断网期间登记的）
+    const onlyLocal=lLogs.filter((x,i)=>!cSet.has(logKey(x,i)));
+    // 库存 = 云端库存 + 本地独有记录的增减量
+    let n=typeof c.n==="number"?c.n:0;
+    onlyLocal.forEach(lg=>{n+=(lg.tp==="in"?(lg.qt||0):-(lg.qt||0));});
+    n=Math.max(0,n);
+    if(onlyLocal.length)recovered+=onlyLocal.length;
+    const base=Object.assign({},c,l); // 文本字段以本地（当前设备刚编辑的）为准
+    base.n=n;
+    base.logs=cLogs.concat(onlyLocal);
+    base.q=String(n);
+    base.t=n===0?"缺货":n<=5?"低库存":"正常";
+    const cAtt=c.att||[],lAtt=l.att||[];
+    const aSet=new Set(cAtt.map(a=>a.aid));
+    base.att=cAtt.concat(lAtt.filter(a=>!aSet.has(a.aid)));
+    merged.push(base);
+  });
+  merged.forEach((it,i)=>{it.id=i;}); // 重排 id 避免冲突
+
+  // ── 出库单：按单号取并集 ──
+  const cSN=cloud.shipNotes||[],lSN=shipNotes||[];
+  const snSeen=new Set(cSN.map(s=>s.no||("id"+s.id)));
+  const onlySN=lSN.filter(s=>!snSeen.has(s.no||("id"+s.id)));
+  const mSN=cSN.concat(onlySN);
+  mSN.sort((a,b)=>String(b.no||"").localeCompare(String(a.no||"")));
+  mSN.forEach((s,i)=>{s.id=i+1;});
+  recovered+=onlySN.length;
+
+  // ── 客户：按姓名+电话取并集，单数取较大值 ──
+  const cCu=cloud.customers||[],lCu=customers||[];
+  const cuMap={};
+  cCu.forEach(c=>{cuMap[(c.name||"")+"|"+(c.phone||"")]=Object.assign({},c);});
+  lCu.forEach(c=>{
+    const k=(c.name||"")+"|"+(c.phone||"");
+    if(cuMap[k]){
+      const e=cuMap[k];
+      e.orders=Math.max(e.orders||0,c.orders||0);
+      if((c.lastDate||"")>(e.lastDate||""))e.lastDate=c.lastDate;
+      e.addr=e.addr||c.addr;e.phone=e.phone||c.phone;
+    }else cuMap[k]=Object.assign({},c);
+  });
+  const mCu=Object.values(cuMap);
+  mCu.forEach((c,i)=>{c.id=i+1;});
+
+  // ── 研发项目：按 id 取并集 ──
+  const cP=cloud.pipe||[],lP=pipe||[];
+  const pSeen=new Set(cP.map(p=>p.id));
+  const mP=cP.concat(lP.filter(p=>!pSeen.has(p.id)));
+
+  // ── 全局操作日志：按内容去重 ──
+  const cL=cloud.logs||[],lL=allLogs||[];
+  const lgSeen=new Set(cL.map(x=>JSON.stringify(x)));
+  const mL=cL.concat(lL.filter(x=>!lgSeen.has(JSON.stringify(x))));
+
+  return{items:merged,shipNotes:mSN,customers:mCu,pipe:mP,logs:mL,
+    seriesSubs:cloud.seriesSubs,recovered};
+}
+
+// 重连对账：合并双方数据，任何一方的登记都不会丢
 async function reconcileOnConnect(){
   if(!sbClient)return;
   try{
-    const{data,error}=await sbClient.from("rigor_inventory").select("payload,updated_at").eq("data_key","main").limit(1).single();
+    const{data}=await sbClient.from("rigor_inventory").select("payload,updated_at").eq("data_key","main").limit(1).single();
     const cloud=(data&&data.payload)?(typeof data.payload==="string"?JSON.parse(data.payload):data.payload):null;
-    if(!cloud||!cloud.items){await pushToCloud();return;}
-    const cloudAt=cloud.savedAt||0;
-    const localAt=getLocalSavedAt();
-    // 本地有未同步改动 → 一定以本地为准
-    if(isDirty()){await pushToCloud();return;}
-    // 比较保存时间：本地更新就推上去，云端更新就拉下来
-    if(localAt>cloudAt){
-      await pushToCloud();
-    }else if(cloudAt>localAt){
-      _lastSbUpdate=data.updated_at;
-      applyCloudData(cloud);
-    }else{
-      // 时间戳一样（或都没有）→ 用数据丰富度兜底，多的一方胜出
-      if(richness(localSnapshot())>richness(cloud))await pushToCloud();
-      else{_lastSbUpdate=data.updated_at;applyCloudData(cloud);}
+    if(!cloud||!cloud.items||!cloud.items.length){await pushToCloud();return;}
+    // 本地还没有数据 → 直接用云端
+    if(!items||!items.length){_lastSbUpdate=data.updated_at;applyCloudData(cloud);return;}
+    // 合并
+    const m=mergeWithCloud(cloud);
+    items=m.items;shipNotes=m.shipNotes;customers=m.customers;pipe=m.pipe;allLogs=m.logs;
+    if(m.seriesSubs)applySeriesSubs(m.seriesSubs);
+    nextId=items.length;
+    snNextId=shipNotes.length?Math.max(...shipNotes.map(n=>n.id||0))+1:1;
+    custNextId=customers.length?Math.max(...customers.map(c=>c.id||0))+1:1;
+    nextPipeId=pipe.length?Math.max(...pipe.map(p=>p.id||0))+1:1;
+    selId=null;
+    _savedAt=Date.now();_localVer++;
+    await pushToCloud();
+    if(m.recovered>0){
+      setTimeout(()=>alert("已合并离线期间的登记记录\n找回 "+m.recovered+" 条本机独有的记录（出入库/出库单/产品）\n库存已按记录重新核算"),300);
     }
+    render();
   }catch(e){
+    console.error("对账失败:",e);
     if(items&&items.length)await pushToCloud();
   }
 }
-// 数据丰富度：产品数 + 出入库记录总数 + 出库单 + 客户，用于时间戳缺失时兜底
+// 数据丰富度：产品数 + 出入库记录总数 + 出库单 + 客户
 function richness(d){
   if(!d)return -1;
   const its=d.items||[];
@@ -291,15 +374,31 @@ function applyCloudData(d){
   render();
 }
 
+// ── 填表保护 ──
+// 用户正在填表或有弹窗时，绝不让同步触发重新渲染，否则输入的内容会被清空
+const EDIT_VIEWS=["add","edit","inout","snform"];
+function isEditing(){
+  try{
+    if(EDIT_VIEWS.indexOf(V)>=0)return true;
+    if(document.querySelector(".overlay"))return true;
+    const ae=document.activeElement;
+    if(ae&&(ae.tagName==="INPUT"||ae.tagName==="TEXTAREA"||ae.tagName==="SELECT"))return true;
+  }catch(e){}
+  return false;
+}
+let _pullDeferred=false;
+
 async function pullFromCloud(){
   if(!sbClient)return;
   // 本地有未同步改动或正在上传时，绝不覆盖本地
   if(isDirty()||_pushInFlight)return;
+  // 正在填表 → 推迟到填完再拉
+  if(isEditing()){_pullDeferred=true;return;}
   try{
     const{data,error}=await sbClient.from("rigor_inventory").select("payload,updated_at").eq("data_key","main").limit(1).single();
     if(error||!data)return;
-    // 拉取前再次确认本地没有产生新改动
-    if(isDirty()||_pushInFlight)return;
+    // 网络往返期间用户可能已开始填表，再确认一次
+    if(isDirty()||_pushInFlight||isEditing()){_pullDeferred=true;return;}
     _lastSbUpdate=data.updated_at;
     const d=typeof data.payload==="string"?JSON.parse(data.payload):data.payload;
     if(d&&d.items)applyCloudData(d);
@@ -309,9 +408,10 @@ async function pullFromCloud(){
 async function pollCloud(){
   // 有任何本地未同步/上传中就跳过，避免把本地改动冲掉
   if(sbSaving||_pushInFlight||isDirty()||!sbConnected||!sbClient)return;
+  if(isEditing()){_pullDeferred=true;return;} // 填表中，本轮跳过
   try{
     const{data}=await sbClient.from("rigor_inventory").select("updated_at").eq("data_key","main").limit(1).single();
-    if(data&&data.updated_at!==_lastSbUpdate)await pullFromCloud();
+    if((data&&data.updated_at!==_lastSbUpdate)||_pullDeferred){_pullDeferred=false;await pullFromCloud();}
   }catch(e){}
 }
 
@@ -321,6 +421,7 @@ async function pushToCloud(){
   if(_pushInFlight){_pushQueued=true;return;}
   _pushInFlight=true;sbSaving=true;
   const verAtPush=_localVer; // 记录本次上传对应的版本
+  try{await makeSnapshot();}catch(e){} // 覆盖前先留存上一版
   try{
     const payload={items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers,savedAt:_savedAt||Date.now()};
     const{data,error}=await sbClient.from("rigor_inventory").upsert({data_key:"main",payload},{onConflict:"data_key"}).select("updated_at").single();
@@ -449,8 +550,15 @@ function confirmImport(){
   const d=window._importData;if(!d)return;
   items=d.items;allLogs=d.logs||[];pipe=d.pipe||pipe;
   applySeriesSubs(d.seriesSubs);
+  // 关键：出库单和客户档案也要恢复
+  if(Array.isArray(d.shipNotes))shipNotes=d.shipNotes;
+  if(Array.isArray(d.customers))customers=d.customers;
   nextId=items.length?Math.max(...items.map(i=>i.id))+1:0;
   nextPipeId=pipe.length?Math.max(...pipe.map(p=>p.id))+1:1;
+  snNextId=shipNotes.length?Math.max(...shipNotes.map(n=>n.id||0))+1:1;
+  custNextId=customers.length?Math.max(...customers.map(c=>c.id||0))+1:1;
+  // 导入的数据视为最新，防止被云端旧数据覆盖
+  _savedAt=Date.now();
   saveState();render();
   window._importData=null;
 }
@@ -481,7 +589,7 @@ const _sbCfg=getSBConfig();
 if(_sbCfg)initSupabase(_sbCfg);
 
 if(!loadFromStorage()){
-  items=RAW.map((d,i)=>({id:i,c:d.c,s:d.s,f:d.f,m:d.m,k:d.k,b:d.b,q:d.q,n:d.n,t:d.t,o:d.o,ln:d.ln||"1",eb:d.eb||"",pr:d.pr||"",qc:{},logs:[],att:[]}));
+  items=RAW.map((d,i)=>({id:i,c:d.c,s:d.s,f:d.f,m:d.m,k:d.k,b:d.b,q:d.q,n:d.n,t:d.t,o:d.o,ln:d.ln||"1",eb:d.eb||"",pr:d.pr||"",spec:d.spec||"",qc:{},logs:[],att:[]}));
   // Auto-generate external batch for items without one
   items.forEach(d=>{if(!d.eb&&d.b)d.eb=genExtBatch(d.c,d.b,d.ln);});
   allLogs=[];
@@ -515,6 +623,22 @@ function getCats(){
   const fromSeries=SERIES.flatMap(s=>s.sub||[]);
   return[...new Set([...fromItems,...fromSeries])].sort((a,b)=>a.localeCompare(b,"zh"));
 }
+// ── 常用选项预设（避免每次手打）──
+const FUNC_OPTS=["","无","羧基-COOH","氨基-NH2","羟基-OH","醛基-CHO","巯基-SH","磺酸基-SO3H","环氧基","季铵基","羧基+氨基","链霉亲和素","蛋白A","蛋白A/G","生物素"];
+const SPEC_OPTS=["","10ml 1wt%","10ml 2.5wt%","10ml 5wt%","10ml 10wt%","5ml 1wt%","5ml 2.5wt%","25ml 1wt%","25ml 2.5wt%","50ml 2.5wt%","100ml 2.5wt%","1g 干粉","5g 干粉","1支","1盒"];
+function onFuncChange(){
+  const sel=document.getElementById("f_f_sel"),inp=document.getElementById("f_f");
+  if(!sel||!inp)return;
+  if(sel.value==="__custom__"){inp.style.display="block";inp.value="";inp.focus();}
+  else{inp.style.display="none";inp.value=sel.value;}
+}
+function onSpecChange(){
+  const sel=document.getElementById("f_spec_sel"),inp=document.getElementById("f_spec");
+  if(!sel||!inp)return;
+  if(sel.value==="__custom__"){inp.style.display="block";inp.value="";inp.focus();}
+  else{inp.style.display="none";inp.value=sel.value;}
+}
+
 function getAllStatuses(){return["正常","低库存","缺货","研发中","待包装","待处理","待开发","待启动"];}
 const PRIO={"":{l:"",b:"",t:"",i:""},"🔴 紧急":{l:"🔴 紧急",b:"#5c1a1a",t:"#f87171",i:"🔴"},"🟠 优先":{l:"🟠 优先",b:"#6b3a00",t:"#fbbf24",i:"🟠"},"🟡 一般":{l:"🟡 一般",b:"#5c4d1a",t:"#facc15",i:"🟡"},"⚪ 暂缓":{l:"⚪ 暂缓",b:"#1e2130",t:"#6b7280",i:"⚪"}};
 function getPrios(){return["🔴 紧急","🟠 优先","🟡 一般","⚪ 暂缓",""];}
@@ -568,6 +692,7 @@ function render(){
   else if(V==="snview")h=rSNView();
   else if(V==="stats")h=rStats();
   else if(V==="cust")h=rCustList();
+  else if(V==="snap")h=rSnapshots();
   h+=`<div class="nav">${[["dash","总览","◉"],["list","库存","☰"],["add","新增","＋"],["snlist","出库单","📋"],["cust","客户","👥"],["stats","统计","📊"],["pipe","研发","🔬"],["sync","同步","☁"]].map(([id,l,i])=>`<button class="${V===id||(id==="snlist"&&(V==="snform"||V==="snview"))?"on":""}" onclick="nav('${id}')"><span style="font-size:16px">${i}</span><span>${l}</span></button>`).join("")}</div>`;
   document.getElementById("app").innerHTML=h;
   bindSearchBox();
@@ -864,7 +989,6 @@ function rAddEdit(d){
   h+=`<div class="form-grid">`;
   const fields=[
     ["s","粒径/规格 *","如 100nm, 2mL, 4.6×50mm"],
-    ["f","官能团/类型","如 羧基-COOH, 蛋白A, 无"],
     ["m","型号","如 PS01010CM"],
     ["k","货号","如 PS02N100NA"],
     ["b","内部批号(YYYYMMDD)","如 20260316"],
@@ -873,6 +997,20 @@ function rAddEdit(d){
   fields.forEach(([key,label,ph])=>{
     h+=`<div class="form-row"><div class="form-label">${label}</div><input class="inp" id="f_${key}" value="${d?d[key]||"":""}" placeholder="${ph}"></div>`;
   });
+  // 官能团：下拉选择（可选自定义）
+  const curF=d?(d.f||""):"";
+  const isCustomF=curF&&FUNC_OPTS.indexOf(curF)<0;
+  h+=`<div class="form-row"><div class="form-label">官能团/类型</div><select class="inp" id="f_f_sel" onchange="onFuncChange()">`;
+  FUNC_OPTS.forEach(o=>{h+=`<option value="${o}"${curF===o?" selected":""}>${o||"— 无 —"}</option>`;});
+  h+=`<option value="__custom__"${isCustomF?" selected":""}>自定义…</option></select>`;
+  h+=`<input class="inp" id="f_f" value="${curF}" placeholder="输入官能团" style="margin-top:6px;display:${isCustomF?"block":"none"}"></div>`;
+  // 规格/浓度：下拉选择（可选自定义）
+  const curSp=d?(d.spec||""):"";
+  const isCustomSp=curSp&&SPEC_OPTS.indexOf(curSp)<0;
+  h+=`<div class="form-row"><div class="form-label">包装规格/浓度（用于出库单）</div><select class="inp" id="f_spec_sel" onchange="onSpecChange()">`;
+  SPEC_OPTS.forEach(o=>{h+=`<option value="${o}"${curSp===o?" selected":""}>${o||"— 未设置 —"}</option>`;});
+  h+=`<option value="__custom__"${isCustomSp?" selected":""}>自定义…</option></select>`;
+  h+=`<input class="inp" id="f_spec" value="${curSp}" placeholder="如 10ml 2.5wt%" style="margin-top:6px;display:${isCustomSp?"block":"none"}"></div>`;
   // Quantity
   h+=`<div class="form-row"><div class="form-label">库存数量</div><input class="inp" type="number" id="f_n" value="${d?d.n:0}"></div>`;
   // Status
@@ -910,6 +1048,7 @@ function getFormData(){
     c:cat,
     s:s,
     f:document.getElementById("f_f").value.trim(),
+    spec:(document.getElementById("f_spec")?document.getElementById("f_spec").value.trim():""),
     m:document.getElementById("f_m").value.trim(),
     k:document.getElementById("f_k").value.trim(),
     b:document.getElementById("f_b").value.trim(),
@@ -1000,9 +1139,21 @@ function rDetail(){
   h+=`<div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e2130"><div style="font-size:10px;color:#60a5fa;margin-bottom:4px">📁 ${fp}/</div><button class="copy-btn" onclick="copyPath('${fp}/')">复制路径</button></div></div>`;
   // In/Out buttons
   h+=`<div style="display:flex;gap:8px;margin-bottom:10px"><button class="btn" style="background:#059669" onclick="startIO(${d.id},'in')">▲ 入库</button><button class="btn" style="background:#dc2626" onclick="startIO(${d.id},'out')">▼ 出库</button></div>`;
+  // 快速设置规格/官能团（不用进编辑页）
+  h+=`<div class="card" style="cursor:default"><div style="font-size:12px;font-weight:600;color:#60a5fa;margin-bottom:8px">⚡ 快速设置</div>`;
+  h+=`<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">`;
+  h+=`<div><div style="font-size:10px;color:#6b7280;margin-bottom:3px">官能团</div><select class="inp" style="padding:6px;font-size:12px" onchange="quickSet(${d.id},'f',this.value)">`;
+  FUNC_OPTS.forEach(o=>{h+=`<option value="${o}"${(d.f||"")===o?" selected":""}>${o||"— 无 —"}</option>`;});
+  if(d.f&&FUNC_OPTS.indexOf(d.f)<0)h+=`<option value="${d.f}" selected>${d.f}</option>`;
+  h+=`</select></div>`;
+  h+=`<div><div style="font-size:10px;color:#6b7280;margin-bottom:3px">包装规格/浓度</div><select class="inp" style="padding:6px;font-size:12px" onchange="quickSet(${d.id},'spec',this.value)">`;
+  SPEC_OPTS.forEach(o=>{h+=`<option value="${o}"${(d.spec||"")===o?" selected":""}>${o||"— 未设置 —"}</option>`;});
+  if(d.spec&&SPEC_OPTS.indexOf(d.spec)<0)h+=`<option value="${d.spec}" selected>${d.spec}</option>`;
+  h+=`</select></div></div>`;
+  h+=`<div style="font-size:10px;color:#4b5563;margin-top:6px">选完立即保存，开出库单时会自动带入</div></div>`;
+
   // Restock priority
   const curP=d.pr||"";
-  h+=`<div class="card" style="cursor:default"><div style="font-size:12px;font-weight:600;color:#fbbf24;margin-bottom:8px">📦 备货优先级</div><div style="display:flex;gap:6px;flex-wrap:wrap">`;
   getPrios().filter(p=>p).forEach(p=>{const pi=PRIO[p];h+=`<button onclick="setPrio(${d.id},'${p}')" style="padding:6px 12px;border-radius:6px;border:1px solid ${curP===p?pi.t+"80":"#2a2e3e"};background:${curP===p?pi.b:"transparent"};color:${curP===p?pi.t:"#6b7280"};font-size:12px;cursor:pointer">${p}</button>`;});
   if(curP)h+=`<button onclick="setPrio(${d.id},'')" style="padding:6px 10px;border-radius:6px;border:1px solid #2a2e3e;background:transparent;color:#4b5563;font-size:11px;cursor:pointer">清除</button>`;
   h+=`</div></div>`;
@@ -1051,7 +1202,8 @@ function doIO(){
   const pv=d.n,nx=modal.tp==="in"?d.n+qt:Math.max(0,d.n-qt);
   d.n=nx;d.t=nx===0?"缺货":nx<=5?"低库存":"正常";
   if(modal.tp==="in"&&bt){d.b=bt;d.eb=genExtBatch(d.c,bt,d.ln);}
-  d.logs.push({tp:modal.tp,qt,bt,dt,pv,nx,eb:d.eb,nt,purpose});
+  const _uid=Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+  d.logs.push({uid:_uid,tp:modal.tp,qt,bt,dt,pv,nx,eb:d.eb,nt,purpose});
   allLogs.push({tp:modal.tp,qt,dt,nm:d.s+" "+d.c,purpose});
   // After outbound, offer to generate shipping note
   if(modal.tp==="out"){
@@ -1088,7 +1240,7 @@ function getCatName(c){
 function startSNFromIO(itemId,qty,batch,dt){
   const d=items.find(i=>i.id===itemId);if(!d)return;
   const eb=d.eb||genExtBatch(d.c,d.b,d.ln);
-  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:dt||new Date().toISOString().slice(0,10),note:"",pack:"纸盒包装",lines:[{k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s,spec:"10ml 2.5wt%",unit:"瓶",qty}]};
+  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:dt||new Date().toISOString().slice(0,10),note:"",pack:"纸盒包装",lines:[{k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s+(d.f&&d.f!=="无"?" "+d.f:""),spec:d.spec||"10ml 2.5wt%",unit:"瓶",qty}]};
   V="snform";render();
 }
 function startNewSN(){
@@ -1170,7 +1322,7 @@ function snPickItem(idx,itemId){
   syncSNDraft();
   const d=items.find(i=>i.id===itemId);if(!d||!snDraft)return;
   const eb=d.eb||genExtBatch(d.c,d.b,d.ln);
-  snDraft.lines[idx]={k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s,spec:"10ml 2.5wt%",unit:"瓶",qty:snDraft.lines[idx].qty||1};
+  snDraft.lines[idx]={k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s+(d.f&&d.f!=="无"?" "+d.f:""),spec:d.spec||"10ml 2.5wt%",unit:"瓶",qty:snDraft.lines[idx].qty||1};
   render();
 }
 // Close search dropdown when clicking outside
@@ -1385,6 +1537,7 @@ th{background:#f0f0f0;font-weight:600}
 }
 
 function toggleQC(id,qid){const d=items.find(i=>i.id===id);if(d){d.qc[qid]=!d.qc[qid];saveState();render();}}
+function quickSet(id,field,val){const d=items.find(i=>i.id===id);if(d){d[field]=val;saveState();render();}}
 function setPrio(id,pr){const d=items.find(i=>i.id===id);if(d){d.pr=pr;saveState();render();}}
 
 function openAttach(id){
@@ -1523,6 +1676,111 @@ async function saveSBConfigFromForm(){
     alert("连接失败，请检查配置信息，并确认已创建数据表。");
   }
 }
+// ═══ 云端版本快照 ═══
+// 用同一张表、不同的 data_key 存历史版本，无需改数据库结构。
+// 每次推送前，如果距上个快照超过 20 分钟，就把「当前云端内容」存为一个快照，
+// 这样任何一次覆盖都有前一版可回滚。最多保留 20 个。
+let _lastSnapAt=0;
+async function makeSnapshot(){
+  if(!sbClient||!sbConnected)return;
+  const now=Date.now();
+  if(now-_lastSnapAt<20*60*1000)return; // 20分钟内不重复快照
+  try{
+    // 取当前云端内容（还没被本次推送覆盖的版本）
+    const{data}=await sbClient.from("rigor_inventory").select("payload").eq("data_key","main").limit(1).single();
+    if(!data||!data.payload)return;
+    const p=typeof data.payload==="string"?JSON.parse(data.payload):data.payload;
+    if(!p||!p.items||!p.items.length)return;
+    const key="snap_"+now;
+    await sbClient.from("rigor_inventory").upsert({data_key:key,payload:p},{onConflict:"data_key"});
+    _lastSnapAt=now;
+    // 清理旧快照，只留最近 20 个
+    const{data:all}=await sbClient.from("rigor_inventory").select("data_key").like("data_key","snap_%");
+    if(all&&all.length>20){
+      const keys=all.map(r=>r.data_key).sort();
+      const del=keys.slice(0,all.length-20);
+      for(const k of del){try{await sbClient.from("rigor_inventory").delete().eq("data_key",k);}catch(e){}}
+    }
+  }catch(e){/* 快照失败不影响正常保存 */}
+}
+
+async function listSnapshots(){
+  if(!sbClient||!sbConnected)return[];
+  try{
+    const{data}=await sbClient.from("rigor_inventory").select("data_key,payload,updated_at").like("data_key","snap_%");
+    if(!data)return[];
+    return data.map(r=>{
+      const p=typeof r.payload==="string"?JSON.parse(r.payload):r.payload;
+      const its=p.items||[];
+      return{key:r.data_key,
+        at:parseInt(r.data_key.replace("snap_",""))||0,
+        items:its.length,
+        io:its.reduce((s,i)=>s+((i.logs&&i.logs.length)||0),0),
+        sn:(p.shipNotes||[]).length,
+        cust:(p.customers||[]).length,
+        stock:its.reduce((s,i)=>s+(i.n||0),0)};
+    }).sort((a,b)=>b.at-a.at);
+  }catch(e){return[];}
+}
+
+async function restoreSnapshot(key){
+  if(!sbClient)return;
+  try{
+    const{data}=await sbClient.from("rigor_inventory").select("payload").eq("data_key",key).limit(1).single();
+    if(!data||!data.payload)return alert("该快照读取失败");
+    const p=typeof data.payload==="string"?JSON.parse(data.payload):data.payload;
+    if(!p||!p.items)return alert("该快照数据无效");
+    // 恢复前先把当前状态存成快照，防止误操作
+    _lastSnapAt=0;await makeSnapshot();
+    _syncedVer=_localVer;
+    applyCloudData(p);
+    _savedAt=Date.now();_localVer++;
+    await pushToCloud();
+    alert("已恢复到该版本\n产品 "+items.length+" 条 · 出库单 "+shipNotes.length+" 张 · 客户 "+customers.length+" 位");
+    render();
+  }catch(e){alert("恢复失败: "+e.message);}
+}
+
+function rSnapshots(){
+  let h=`<div style="padding:16px"><button onclick="V='sync';render()" style="background:none;border:none;color:#6b7280;font-size:12px;cursor:pointer;margin-bottom:10px">← 返回同步页</button>`;
+  h+=`<div style="font-size:17px;font-weight:700;color:#fff;margin-bottom:4px">🕐 云端版本历史</div>`;
+  h+=`<div style="font-size:11px;color:#6b7280;margin-bottom:14px">系统会在数据被覆盖前自动留存快照，可回滚到任意一版</div>`;
+  h+=`<div id="snapBody"><div style="text-align:center;padding:30px;color:#4b5563">读取中…</div></div></div>`;
+  setTimeout(loadSnapUI,50);
+  return h;
+}
+async function loadSnapUI(){
+  const el=document.getElementById("snapBody");if(!el)return;
+  const list=await listSnapshots();
+  if(!list.length){el.innerHTML=`<div style="text-align:center;padding:30px;color:#4b5563">暂无历史快照<br><span style="font-size:12px">系统运行一段时间后会自动生成</span></div>`;return;}
+  let h="";
+  list.forEach(s=>{
+    h+=`<div class="card" style="cursor:default">`;
+    h+=`<div style="font-size:13px;font-weight:600;color:#fff;margin-bottom:6px">${new Date(s.at).toLocaleString("zh-CN")}</div>`;
+    h+=`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;font-size:11px;text-align:center;margin-bottom:8px">`;
+    h+=`<div><div style="font-size:16px;font-weight:700;color:#60a5fa">${s.items}</div><div style="color:#6b7280">产品</div></div>`;
+    h+=`<div><div style="font-size:16px;font-weight:700;color:#fbbf24">${s.io}</div><div style="color:#6b7280">出入库</div></div>`;
+    h+=`<div><div style="font-size:16px;font-weight:700;color:#34d399">${s.sn}</div><div style="color:#6b7280">出库单</div></div>`;
+    h+=`<div><div style="font-size:16px;font-weight:700;color:#c084fc">${s.cust}</div><div style="color:#6b7280">客户</div></div>`;
+    h+=`</div>`;
+    h+=`<div style="font-size:10px;color:#4b5563;margin-bottom:8px">库存合计 ${s.stock}</div>`;
+    h+=`<button class="btn" style="background:#1e3a5f;padding:8px" onclick="confirmRestoreSnap('${s.key}')">恢复到这一版</button></div>`;
+  });
+  el.innerHTML=h;
+}
+function confirmRestoreSnap(key){
+  const ov=document.createElement("div");ov.className="overlay";ov.id="rsOv";
+  ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
+    <div style="font-size:40px;margin-bottom:12px">🕐</div>
+    <div style="font-size:15px;font-weight:700;color:#fbbf24;margin-bottom:8px">恢复到这个版本？</div>
+    <div style="font-size:12px;color:#9ca3af;margin-bottom:20px">当前数据会先自动存为快照，可以再恢复回来</div>
+    <div style="display:flex;gap:10px">
+      <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('rsOv').remove()">取消</button>
+      <button class="btn" style="background:#2563eb;flex:1" onclick="document.getElementById('rsOv').remove();restoreSnapshot('${key}')">确认恢复</button>
+    </div></div>`;
+  document.body.appendChild(ov);
+}
+
 // 手动解决数据冲突
 async function forcePush(){
   if(!sbConnected)return alert("未连接云数据库");
@@ -1763,6 +2021,7 @@ create policy "Allow all" on rigor_inventory for all using (true) with check (tr
     h+=`<div style="font-size:10px;color:#6b7280;margin-bottom:10px;padding:6px 8px;background:#111318;border-radius:6px">${getSBConfig().url||"—"}</div>`;
     h+=`<div style="display:flex;gap:8px;margin-bottom:8px"><button class="btn" style="background:#059669;flex:1" onclick="forcePush()">⬆ 本地覆盖云端</button><button class="btn" style="background:#1e3a5f;flex:1" onclick="forcePull()">⬇ 云端覆盖本地</button></div>`;
     h+=`<div style="font-size:10px;color:#4b5563;margin-bottom:8px;padding:6px;background:#111318;border-radius:6px">数据对不上时用这两个按钮手动解决：确认本机数据是最新的就点「本地覆盖云端」，反之点「云端覆盖本地」</div>`;
+    h+=`<button class="btn" style="background:#4c1d95;margin-bottom:8px" onclick="V='snap';render()">🕐 查看云端版本历史 / 回滚</button>`;
     h+=`<button class="btn" style="background:#374151" onclick="disconnectSB()">断开连接</button></div>`;
   }
 
