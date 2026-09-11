@@ -238,9 +238,14 @@ async function initSupabase(cfg){
 // 断网期间双方各自的出入库记录、出库单、客户都保留，库存按记录增量重算
 function logKey(lg,idx){
   if(lg&&lg.uid)return lg.uid;
-  return "L"+idx+"_"+(lg&&lg.tp||"")+"_"+(lg&&lg.qt||0)+"_"+(lg&&lg.dt||"")+"_"+(lg&&lg.bt||"");
+  // 内容指纹：跨设备/跨备份去重都稳定，不受排列顺序影响
+  return [lg&&lg.tp,lg&&lg.qt,lg&&lg.dt,(lg&&lg.bt)||"",lg&&lg.pv,lg&&lg.nx].join("_");
 }
-function itemKey(i){return (i.k&&String(i.k).trim())?("K:"+String(i.k).trim()):("I:"+i.id);}
+// 判重用四要素：货号+分类+粒径+官能团。
+// 只用货号会出事——实际数据里存在不同产品共用同一货号的情况（如羧基和磺酸基）
+function itemKey(i){
+  return [String(i.k||"").trim(),String(i.c||"").trim(),String(i.s||"").trim(),String(i.f||"").trim()].join("|");
+}
 
 function mergeWithCloud(cloud){
   // ── 产品 & 出入库记录 ──
@@ -261,13 +266,13 @@ function mergeWithCloud(cloud){
     // 库存 = 云端库存 + 本地独有记录的增减量
     let n=typeof c.n==="number"?c.n:0;
     onlyLocal.forEach(lg=>{n+=(lg.tp==="in"?(lg.qt||0):-(lg.qt||0));});
-    n=Math.max(0,n);
+    n=roundQty(Math.max(0,n));
     if(onlyLocal.length)recovered+=onlyLocal.length;
     const base=Object.assign({},c,l); // 文本字段以本地（当前设备刚编辑的）为准
     base.n=n;
     base.logs=cLogs.concat(onlyLocal);
     base.q=String(n);
-    base.t=n===0?"缺货":n<=5?"低库存":"正常";
+    base.t=stockStatus(n);
     const cAtt=c.att||[],lAtt=l.att||[];
     const aSet=new Set(cAtt.map(a=>a.aid));
     base.att=cAtt.concat(lAtt.filter(a=>!aSet.has(a.aid)));
@@ -526,17 +531,31 @@ function importData(){
         const d=JSON.parse(ev.target.result);
         if(!d.items||!Array.isArray(d.items)){alert("文件格式不正确");return;}
         window._importData=d;
+        const bIO=(d.items||[]).reduce((s,i)=>s+((i.logs&&i.logs.length)||0),0);
+        // 预览：这份备份里有多少是当前系统没有的
+        const curKeys=new Set(items.map(itemKey));
+        const newCnt=(d.items||[]).filter(i=>!curKeys.has(itemKey(i))).length;
+        const snSeen=new Set(shipNotes.map(s=>s.no||""));
+        const newSN=(d.shipNotes||[]).filter(s=>!snSeen.has(s.no||"")).length;
         const ov=document.createElement("div");ov.className="overlay";ov.id="importOv";
-        ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
-          <div style="font-size:40px;margin-bottom:12px">📥</div>
-          <div style="font-size:15px;font-weight:700;color:#fff;margin-bottom:8px">确认导入？</div>
-          <div style="font-size:13px;color:#9ca3af;margin-bottom:6px">将<span style="color:#f87171">覆盖</span>当前全部数据</div>
-          <div style="font-size:12px;color:#818cf8;margin-bottom:6px">${d.items.length} 条产品 · ${(d.pipe||[]).length} 条研发项目</div>
-          <div style="font-size:11px;color:#6b7280;margin-bottom:20px">导出时间: ${d.lastSync||"未知"}</div>
-          <div style="display:flex;gap:10px">
-            <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('importOv').remove()">取消</button>
-            <button class="btn" style="background:#6366f1;flex:1" onclick="confirmImport()">确认导入</button>
+        ov.innerHTML=`<div class="modal" style="padding:26px">
+          <div style="text-align:center;font-size:34px;margin-bottom:8px">📥</div>
+          <div style="text-align:center;font-size:16px;font-weight:700;color:#fff;margin-bottom:12px">选择导入方式</div>
+          <div style="background:#111318;border-radius:8px;padding:10px;margin-bottom:14px;font-size:12px;line-height:1.9">
+            <div style="color:#6b7280;margin-bottom:4px">备份文件内容</div>
+            <div style="color:#e5e7eb">产品 <b style="color:#60a5fa">${(d.items||[]).length}</b> 条 · 出入库 <b style="color:#fbbf24">${bIO}</b> 条</div>
+            <div style="color:#e5e7eb">出库单 <b style="color:#34d399">${(d.shipNotes||[]).length}</b> 张 · 客户 <b style="color:#c084fc">${(d.customers||[]).length}</b> 位</div>
+            <div style="color:#4b5563;font-size:11px;margin-top:4px">导出时间: ${d.lastSync||"未知"}</div>
           </div>
+          <div style="background:#052e26;border:1px solid #065f46;border-radius:8px;padding:10px;margin-bottom:14px;font-size:12px">
+            <div style="color:#6ee7b7;font-weight:600;margin-bottom:3px">合并后预计新增</div>
+            <div style="color:#e5e7eb">产品 ${newCnt} 条 · 出库单 ${newSN} 张（重复的会自动跳过）</div>
+          </div>
+          <button class="btn" style="background:#059669;margin-bottom:8px" onclick="confirmMergeImport()">✅ 合并导入（推荐·保留现有数据）</button>
+          <div style="font-size:11px;color:#6b7280;margin-bottom:14px;line-height:1.7">现有产品的库存数字和信息<b style="color:#34d399">完全不动</b>，只补进备份里缺失的产品、出入库历史、出库单和客户</div>
+          <button class="btn" style="background:#7f1d1d;margin-bottom:8px" onclick="confirmImport()">⚠️ 覆盖导入（清空后完全替换）</button>
+          <div style="font-size:11px;color:#6b7280;margin-bottom:14px">当前所有数据将被删除，只保留备份内容</div>
+          <button class="btn" style="background:#374151" onclick="document.getElementById('importOv').remove()">取消</button>
         </div>`;
         document.body.appendChild(ov);
       }catch(err){alert("导入失败："+err.message);}
@@ -545,6 +564,102 @@ function importData(){
   };
   inp.click();
 }
+// ═══ 合并导入（只补充，不覆盖现有数据）═══
+// 规则：现有产品的库存/字段一律保持不变，只把备份里「缺失的」补进来
+function mergeImport(bak){
+  const st={newItems:0,newLogs:0,newSN:0,newCust:0,newPipe:0,skipped:0,dupInBak:0};
+  // ── 产品 ──
+  const cur={};
+  items.forEach(i=>{cur[itemKey(i)]=i;});
+  const addedNow=new Set(); // 本次导入新增的 key，用于识别备份内部重复
+  (bak.items||[]).forEach(bi=>{
+    const k=itemKey(bi);
+    let ex=cur[k];
+    // 备份文件内部本身就重复的条目 → 也照样保留，避免丢数据，留给人工核对
+    if(ex&&addedNow.has(k)){st.dupInBak++;ex=null;}
+    if(!ex){
+      // 备份独有的产品 → 整条补进来
+      const ni=Object.assign({},bi);
+      ni.id=nextId++;
+      ni.qc=ni.qc||{};ni.att=ni.att||[];ni.logs=ni.logs||[];
+      items.push(ni);cur[k]=ni;addedNow.add(k);st.newItems++;
+      st.newLogs+=ni.logs.length;
+    }else{
+      // 已存在 → 库存和字段一概不动，只补历史出入库记录
+      const seen=new Set((ex.logs||[]).map((x,i)=>logKey(x,i)));
+      const add=(bi.logs||[]).filter((x,i)=>!seen.has(logKey(x,i)));
+      if(add.length){
+        ex.logs=(ex.logs||[]).concat(add);
+        st.newLogs+=add.length;
+      }
+      // 空白字段用备份补齐（不覆盖已有内容）
+      ["m","k","b","eb","f","spec","o","ln"].forEach(f=>{
+        if((ex[f]===undefined||ex[f]==="")&&bi[f])ex[f]=bi[f];
+      });
+      // 附件补充
+      const aSeen=new Set((ex.att||[]).map(a=>a.aid));
+      const aAdd=(bi.att||[]).filter(a=>!aSeen.has(a.aid));
+      if(aAdd.length)ex.att=(ex.att||[]).concat(aAdd);
+      st.skipped++;
+    }
+  });
+  // 出入库记录按日期排序，历史看起来才连贯
+  items.forEach(i=>{if(i.logs&&i.logs.length>1)i.logs.sort((a,b)=>String(a.dt||"").localeCompare(String(b.dt||"")));});
+
+  // ── 出库单：按单号补充 ──
+  const snSeen=new Set(shipNotes.map(s=>s.no||JSON.stringify(s.lines)));
+  (bak.shipNotes||[]).forEach(bs=>{
+    const k=bs.no||JSON.stringify(bs.lines);
+    if(!snSeen.has(k)){
+      const ns=Object.assign({},bs);ns.id=snNextId++;
+      shipNotes.push(ns);snSeen.add(k);st.newSN++;
+    }
+  });
+  shipNotes.sort((a,b)=>String(b.no||"").localeCompare(String(a.no||"")));
+
+  // ── 客户：按姓名+电话补充 ──
+  const cuSeen=new Set(customers.map(c=>(c.name||"")+"|"+(c.phone||"")));
+  (bak.customers||[]).forEach(bc=>{
+    const k=(bc.name||"")+"|"+(bc.phone||"");
+    if(!cuSeen.has(k)){
+      const nc=Object.assign({},bc);nc.id=custNextId++;
+      customers.push(nc);cuSeen.add(k);st.newCust++;
+    }
+  });
+
+  // ── 研发项目：按名称补充 ──
+  const pSeen=new Set((pipe||[]).map(p=>(p.nm||p.name||"")+"|"+(p.s||"")));
+  (bak.pipe||[]).forEach(bp=>{
+    const k=(bp.nm||bp.name||"")+"|"+(bp.s||"");
+    if(!pSeen.has(k)){
+      const np=Object.assign({},bp);np.id=nextPipeId++;
+      pipe.push(np);pSeen.add(k);st.newPipe++;
+    }
+  });
+
+  // ── 分类：备份里有而当前没有的子分类补进来 ──
+  if(bak.seriesSubs){
+    bak.seriesSubs.forEach(bs=>{
+      const sr=SERIES.find(s=>s.id===bs.id);
+      if(sr&&Array.isArray(bs.sub))bs.sub.forEach(c=>{if(sr.sub.indexOf(c)<0)sr.sub.push(c);});
+    });
+  }
+  return st;
+}
+
+function confirmMergeImport(){
+  const el=document.getElementById("importOv");if(el)el.remove();
+  const d=window._importData;if(!d)return;
+  let st;
+  try{st=mergeImport(d);}catch(e){alert("合并失败："+e.message);return;}
+  _savedAt=Date.now();
+  saveState();render();
+  window._importData=null;
+  setTimeout(()=>{
+    alert("合并完成\n\n新增产品："+st.newItems+" 条\n补充出入库记录："+st.newLogs+" 条\n新增出库单："+st.newSN+" 张\n新增客户："+st.newCust+" 位\n新增研发项目："+st.newPipe+" 条\n\n已有产品 "+st.skipped+" 条保持原样，库存未改动");
+  },200);
+}
+
 function confirmImport(){
   document.getElementById("importOv").remove();
   const d=window._importData;if(!d)return;
@@ -637,6 +752,26 @@ function onSpecChange(){
   if(!sel||!inp)return;
   if(sel.value==="__custom__"){inp.style.display="block";inp.value="";inp.focus();}
   else{inp.style.display="none";inp.value=sel.value;}
+}
+
+// ── 小数数量支持 ──
+// 库存支持 0.1 / 0.5 这类小包装。浮点运算会产生 0.30000000000000004 这种误差，
+// 所以所有加减结果统一保留 2 位小数；显示时去掉多余的 0（2 显示为 2，不是 2.00）
+function roundQty(v){
+  const n=Number(v);
+  if(!isFinite(n))return 0;
+  return Math.round(n*100)/100;
+}
+function fmtQty(v){
+  const n=Number(v);
+  if(!isFinite(n))return "0";
+  return String(Math.round(n*100)/100);
+}
+function stockStatus(n){
+  const v=roundQty(n);
+  if(v<=0)return "缺货";
+  if(v<=5)return "低库存";
+  return "正常";
 }
 
 function getAllStatuses(){return["正常","低库存","缺货","研发中","待包装","待处理","待开发","待启动"];}
@@ -794,7 +929,7 @@ function rDash(){
   h+=`</div>`;
   h+=`<button class="sm" style="width:100%;background:#1e2130;border:1px solid #2a2e3e;color:#818cf8;margin:10px 0 18px" onclick="nav('pipe')">查看全部管线 →</button>`;
   // Recent logs
-  if(allLogs.length){h+=`<div style="font-size:14px;font-weight:600;color:#9ca3af;margin:4px 0 8px">最近操作</div>`;allLogs.slice(-5).reverse().forEach(l=>{h+=`<div style="padding:7px 0;border-bottom:1px solid #151821;font-size:13px"><span style="color:${l.tp==="in"?"#34d399":"#f87171"}">${l.tp==="in"?"▲入库":"▼出库"}</span><span style="color:#9ca3af;margin-left:8px">${l.nm}</span><span style="color:#fff;margin-left:8px">×${l.qt}</span></div>`;});}
+  if(allLogs.length){h+=`<div style="font-size:14px;font-weight:600;color:#9ca3af;margin:4px 0 8px">最近操作</div>`;allLogs.slice(-5).reverse().forEach(l=>{h+=`<div style="padding:7px 0;border-bottom:1px solid #151821;font-size:13px"><span style="color:${l.tp==="in"?"#34d399":"#f87171"}">${l.tp==="in"?"▲入库":"▼出库"}</span><span style="color:#9ca3af;margin-left:8px">${l.nm}</span><span style="color:#fff;margin-left:8px">×${fmtQty(l.qt)}</span></div>`;});}
   h+=`</div>`;return h;
 }
 
@@ -935,7 +1070,7 @@ function rListItems(){
   let h=`<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 20px 8px"><span style="font-size:12px;color:#4b5563">${fl.length} 条记录${subCatF!=="全部"&&subCatF!=="__all__"?` · ${subCatF}`:""}</span><button onclick="toggleDelMode()" style="font-size:11px;padding:4px 12px;border-radius:6px;border:1px solid ${delMode?'#f87171':'#2a2e3e'};background:${delMode?'#5c1a1a':'transparent'};color:${delMode?'#f87171':'#6b7280'};cursor:pointer">${delMode?'✓ 完成':'🗑️ 管理'}</button></div>`;
   h+=`<div style="padding:0 10px">`;
   fl.forEach(d=>{const st=gs(d.t);const sr=fs(d.c);const qd=QC.filter(q=>d.qc[q.id]).length;
-    h+=`<div class="item" onclick="${delMode?'':`selId=${d.id};V='detail';render()`}"><div style="width:6px;height:6px;border-radius:50%;background:${st.d};flex-shrink:0"></div><div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="font-size:15px;font-weight:600;color:#fff">${d.s||"—"}</span><span style="font-size:11px;color:${sr.color}">${d.c}</span>${d.f&&d.f!=="无"&&d.f!==""?`<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:#1e2130;color:#818cf8">${d.f}</span>`:""}</div><div style="font-size:12px;color:#4b5563;margin-top:2px">${d.m||""}${d.k?" · "+d.k:""}${qd?` <span style="color:${qd>=6?"#34d399":"#fbbf24"}">QC ${qd}/6</span>`:""}${d.pr?` <span style="font-size:10px">${PRIO[d.pr]?.i||""}</span>`:""}</div></div><div style="text-align:right;flex-shrink:0"><div style="font-size:16px;font-weight:700;color:${st.t}">${d.n>0?d.n:"—"}</div><span class="tag" style="background:${st.b};color:${st.t}">${d.t}</span></div>${delMode?`<button onclick="event.stopPropagation();doDelete(${d.id})" style="background:none;border:none;color:#f87171;cursor:pointer;font-size:18px;padding:6px 8px;flex-shrink:0">✕</button>`:""}</div>`;
+    h+=`<div class="item" onclick="${delMode?'':`selId=${d.id};V='detail';render()`}"><div style="width:6px;height:6px;border-radius:50%;background:${st.d};flex-shrink:0"></div><div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="font-size:15px;font-weight:600;color:#fff">${d.s||"—"}</span><span style="font-size:11px;color:${sr.color}">${d.c}</span>${d.f&&d.f!=="无"&&d.f!==""?`<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:#1e2130;color:#818cf8">${d.f}</span>`:""}</div><div style="font-size:12px;color:#4b5563;margin-top:2px">${d.m||""}${d.k?" · "+d.k:""}${qd?` <span style="color:${qd>=6?"#34d399":"#fbbf24"}">QC ${qd}/6</span>`:""}${d.pr?` <span style="font-size:10px">${PRIO[d.pr]?.i||""}</span>`:""}</div></div><div style="text-align:right;flex-shrink:0"><div style="font-size:16px;font-weight:700;color:${st.t}">${d.n>0?fmtQty(d.n):"—"}</div><span class="tag" style="background:${st.b};color:${st.t}">${d.t}</span></div>${delMode?`<button onclick="event.stopPropagation();doDelete(${d.id})" style="background:none;border:none;color:#f87171;cursor:pointer;font-size:18px;padding:6px 8px;flex-shrink:0">✕</button>`:""}</div>`;
   });
   if(!fl.length)h+=`<div style="text-align:center;padding:40px;color:#4b5563">无匹配产品</div>`;
   h+=`</div>`;return h;
@@ -1012,7 +1147,7 @@ function rAddEdit(d){
   h+=`<option value="__custom__"${isCustomSp?" selected":""}>自定义…</option></select>`;
   h+=`<input class="inp" id="f_spec" value="${curSp}" placeholder="如 10ml 2.5wt%" style="margin-top:6px;display:${isCustomSp?"block":"none"}"></div>`;
   // Quantity
-  h+=`<div class="form-row"><div class="form-label">库存数量</div><input class="inp" type="number" id="f_n" value="${d?d.n:0}"></div>`;
+  h+=`<div class="form-row"><div class="form-label">库存数量</div><input class="inp" type="number" step="0.1" min="0" id="f_n" value="${d?d.n:0}"></div>`;
   // Status
   h+=`<div class="form-row"><div class="form-label">库存状态</div><select class="inp" id="f_t">`;
   getAllStatuses().forEach(s=>{h+=`<option value="${s}"${d&&d.t===s?" selected":""}>${s}</option>`;});
@@ -1054,7 +1189,7 @@ function getFormData(){
     b:document.getElementById("f_b").value.trim(),
     ln:document.getElementById("f_ln").value.trim()||"1",
     eb:document.getElementById("f_eb").value.trim(),
-    n:parseInt(document.getElementById("f_n").value)||0,
+    n:roundQty(parseFloat(document.getElementById("f_n").value))||0,
     t:document.getElementById("f_t").value,
     pr:document.getElementById("f_pr").value,
     o:document.getElementById("f_o").value.trim()
@@ -1121,7 +1256,7 @@ function rDetail(){
   const st=gs(d.t);const sr=fs(d.c);const fp=makePath(d);
   let h=`<div style="padding:20px"><button onclick="V='list';render()" style="background:none;border:none;color:#6b7280;font-size:13px;cursor:pointer;margin-bottom:12px">← 返回列表</button>`;
   // Header
-  h+=`<div class="card" style="display:flex;align-items:center;gap:14px;cursor:default"><div style="width:48px;height:48px;border-radius:12px;background:${sr.color}20;display:flex;align-items:center;justify-content:center;font-size:22px;color:${sr.color}">${sr.icon}</div><div style="flex:1"><div style="font-size:18px;font-weight:700;color:#fff">${d.s||"—"}</div><div style="font-size:13px;color:${sr.color}">${sr.name} · ${d.c}</div>${d.f&&d.f!=="无"?`<div style="font-size:12px;color:#818cf8">${d.f}</div>`:""}</div><div style="text-align:center"><div style="font-size:30px;font-weight:700;color:${st.t}">${d.n}</div><span class="tag" style="background:${st.b};color:${st.t}">${d.t}</span></div></div>`;
+  h+=`<div class="card" style="display:flex;align-items:center;gap:14px;cursor:default"><div style="width:48px;height:48px;border-radius:12px;background:${sr.color}20;display:flex;align-items:center;justify-content:center;font-size:22px;color:${sr.color}">${sr.icon}</div><div style="flex:1"><div style="font-size:18px;font-weight:700;color:#fff">${d.s||"—"}</div><div style="font-size:13px;color:${sr.color}">${sr.name} · ${d.c}</div>${d.f&&d.f!=="无"?`<div style="font-size:12px;color:#818cf8">${d.f}</div>`:""}</div><div style="text-align:center"><div style="font-size:30px;font-weight:700;color:${st.t}">${fmtQty(d.n)}</div><span class="tag" style="background:${st.b};color:${st.t}">${d.t}</span></div></div>`;
   // Info + edit button
   h+=`<div class="card" style="cursor:default"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-size:12px;font-weight:600;color:#9ca3af">产品信息</span><div style="display:flex;gap:6px"><button class="edit-btn" onclick="V='edit';render()">✏️ 编辑</button><button class="del-btn" onclick="doDelete(${d.id})">🗑️ 删除</button></div></div>`;
   h+=`<div class="detail-info" style="display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;font-size:13px">`;
@@ -1171,7 +1306,7 @@ function rDetail(){
   // Logs
   h+=`<div class="card" style="cursor:default"><div style="font-size:12px;font-weight:600;color:#9ca3af;margin-bottom:6px">📋 出入库记录</div>`;
   if(!d.logs.length)h+=`<div style="font-size:11px;color:#4b5563;text-align:center;padding:8px">暂无</div>`;
-  else d.logs.slice().reverse().forEach(l=>{h+=`<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #1a1d27;font-size:11px"><span style="color:${l.tp==="in"?"#34d399":"#f87171"};font-weight:600">${l.tp==="in"?"▲入":"▼出"}</span><span style="color:#fff">×${l.qt}</span><span style="color:#4b5563">${l.pv}→${l.nx}</span>${l.bt?`<span style="color:#818cf8;font-size:9px">${l.bt}</span>`:""}<span style="color:#4b5563;margin-left:auto">${l.dt}</span></div>`;});
+  else d.logs.slice().reverse().forEach(l=>{h+=`<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #1a1d27;font-size:11px"><span style="color:${l.tp==="in"?"#34d399":"#f87171"};font-weight:600">${l.tp==="in"?"▲入":"▼出"}</span><span style="color:#fff">×${fmtQty(l.qt)}</span><span style="color:#4b5563">${l.pv}→${l.nx}</span>${l.bt?`<span style="color:#818cf8;font-size:9px">${l.bt}</span>`:""}<span style="color:#4b5563;margin-left:auto">${l.dt}</span></div>`;});
   h+=`</div></div>`;return h;
 }
 
@@ -1180,8 +1315,8 @@ function rInOut(){
   const d=items.find(i=>i.id===selId);if(!d)return"";const isIn=modal.tp==="in";const cl=isIn?"#059669":"#dc2626";
   let h=`<div style="padding:16px"><button onclick="V='detail';modal=null;render()" style="background:none;border:none;color:#6b7280;font-size:12px;cursor:pointer;margin-bottom:10px">← 返回</button>`;
   h+=`<div style="font-size:17px;font-weight:700;color:${cl};margin-bottom:14px">${isIn?"▲ 入库":"▼ 出库"}</div>`;
-  h+=`<div class="card" style="cursor:default"><div style="font-size:13px;color:#fff">${d.s} · ${d.c}</div><div style="font-size:11px;color:#6b7280">当前: ${d.n}</div></div>`;
-  h+=`<div class="form-row"><div class="form-label">数量 *</div><input class="inp" type="number" id="ioQty" placeholder="输入数量"></div>`;
+  h+=`<div class="card" style="cursor:default"><div style="font-size:13px;color:#fff">${d.s} · ${d.c}</div><div style="font-size:11px;color:#6b7280">当前: ${fmtQty(d.n)}</div></div>`;
+  h+=`<div class="form-row"><div class="form-label">数量 *</div><input class="inp" type="number" step="0.1" min="0" id="ioQty" placeholder="输入数量，可填小数如 0.5"></div>`;
   h+=`<div class="form-row"><div class="form-label">内部批号</div><input class="inp" id="ioBat" value="${d.b||""}" placeholder="如 20260316" oninput="updateIOExtBatch()"></div>`;
   const curExtB=d.eb||genExtBatch(d.c,d.b,d.ln);
   h+=`<div style="padding:8px 10px;border-radius:6px;background:#1e3a5f30;border:1px solid #2563eb30;margin-bottom:10px"><div style="font-size:10px;color:#60a5fa;margin-bottom:2px">🏷️ 对应客户批号</div><div id="ioExtBat" style="font-size:16px;font-weight:700;color:#fff;font-family:monospace;letter-spacing:1px">${curExtB||"—"}</div></div>`;
@@ -1195,12 +1330,12 @@ function rInOut(){
 function startIO(id,tp){selId=id;modal={tp};V="inout";render();}
 function doIO(){
   const d=items.find(i=>i.id===selId);if(!d)return;
-  const qt=parseInt(document.getElementById("ioQty").value);if(!qt||qt<=0)return alert("请输入数量");
+  const qt=roundQty(parseFloat(document.getElementById("ioQty").value));if(!qt||qt<=0)return alert("请输入数量");
   const bt=document.getElementById("ioBat").value,dt=document.getElementById("ioDt").value;
   const nt=document.getElementById("ioNt")?document.getElementById("ioNt").value:"";
   const purpose=document.getElementById("ioPurpose")?document.getElementById("ioPurpose").value:"";
-  const pv=d.n,nx=modal.tp==="in"?d.n+qt:Math.max(0,d.n-qt);
-  d.n=nx;d.t=nx===0?"缺货":nx<=5?"低库存":"正常";
+  const pv=d.n,nx=roundQty(modal.tp==="in"?d.n+qt:Math.max(0,d.n-qt));
+  d.n=nx;d.t=stockStatus(nx);
   if(modal.tp==="in"&&bt){d.b=bt;d.eb=genExtBatch(d.c,bt,d.ln);}
   const _uid=Date.now().toString(36)+Math.random().toString(36).slice(2,7);
   d.logs.push({uid:_uid,tp:modal.tp,qt,bt,dt,pv,nx,eb:d.eb,nt,purpose});
@@ -1273,7 +1408,7 @@ function rSNForm(){
     h+=`<div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:6px">`;
     h+=`<div class="form-row"><div class="form-label">规格</div><input class="inp sn-f" data-idx="${idx}" data-key="spec" value="${ln.spec}" placeholder="10ml 2.5wt%"></div>`;
     h+=`<div class="form-row"><div class="form-label">单位</div><input class="inp sn-f" data-idx="${idx}" data-key="unit" value="${ln.unit}" placeholder="瓶"></div>`;
-    h+=`<div class="form-row"><div class="form-label">数量</div><input class="inp sn-f" data-idx="${idx}" data-key="qty" type="number" value="${ln.qty}"></div>`;
+    h+=`<div class="form-row"><div class="form-label">数量</div><input class="inp sn-f" data-idx="${idx}" data-key="qty" type="number" step="0.1" min="0" value="${ln.qty}"></div>`;
     h+=`</div></div>`;
   });
   h+=`</div>`;
@@ -1294,7 +1429,7 @@ function syncSNDraft(){
   snDraft.pack=gv("sn_pack");snDraft.ship_dt=gv("sn_dt");snDraft.note=gv("sn_note");
   document.querySelectorAll(".sn-f").forEach(el=>{
     const idx=parseInt(el.dataset.idx),key=el.dataset.key;
-    if(snDraft.lines[idx])snDraft.lines[idx][key]=key==="qty"?parseInt(el.value)||1:el.value;
+    if(snDraft.lines[idx])snDraft.lines[idx][key]=key==="qty"?(roundQty(parseFloat(el.value))||1):el.value;
   });
 }
 function addSNLine(){syncSNDraft();snDraft.lines.push({k:"",eb:"",name:"",spec:"10ml 2.5wt%",unit:"瓶",qty:1});render();}
@@ -1313,7 +1448,7 @@ function snSearch(idx,q){
     const sr=fs(d.c);
     dh+=`<div onclick="snPickItem(${idx},${d.id})" style="padding:8px 10px;cursor:pointer;border-bottom:1px solid #151821;transition:background .1s" onmouseover="this.style.background='#2a2e3e'" onmouseout="this.style.background='transparent'">`;
     dh+=`<div style="display:flex;align-items:center;gap:6px"><span style="font-size:13px;font-weight:600;color:#fff">${d.s}</span><span style="font-size:11px;color:${sr.color}">${d.c}</span></div>`;
-    dh+=`<div style="font-size:11px;color:#6b7280;margin-top:2px">${d.k||"—"} · ${d.m||""} · 批号: ${d.eb||d.b||"—"} · 库存: ${d.n}</div>`;
+    dh+=`<div style="font-size:11px;color:#6b7280;margin-top:2px">${d.k||"—"} · ${d.m||""} · 批号: ${d.eb||d.b||"—"} · 库存: ${fmtQty(d.n)}</div>`;
     dh+=`</div>`;
   });
   drop.innerHTML=dh;drop.style.display="block";
@@ -1479,7 +1614,7 @@ function rSNView(){
   ["货号","批号","产品名称","规格","单位","数量"].forEach(th=>{h+=`<th style="padding:6px 8px;text-align:left;color:#6b7280;font-weight:500">${th}</th>`;});
   h+=`</tr></thead><tbody>`;
   sn.lines.forEach(ln=>{
-    h+=`<tr style="border-bottom:1px solid #151821"><td style="padding:6px 8px;font-family:monospace;color:#818cf8">${ln.k}</td><td style="padding:6px 8px;font-family:monospace">${ln.eb}</td><td style="padding:6px 8px">${ln.name}</td><td style="padding:6px 8px">${ln.spec}</td><td style="padding:6px 8px">${ln.unit}</td><td style="padding:6px 8px;font-weight:600">${ln.qty}</td></tr>`;
+    h+=`<tr style="border-bottom:1px solid #151821"><td style="padding:6px 8px;font-family:monospace;color:#818cf8">${ln.k}</td><td style="padding:6px 8px;font-family:monospace">${ln.eb}</td><td style="padding:6px 8px">${ln.name}</td><td style="padding:6px 8px">${ln.spec}</td><td style="padding:6px 8px">${ln.unit}</td><td style="padding:6px 8px;font-weight:600">${fmtQty(ln.qty)}</td></tr>`;
   });
   h+=`</tbody></table></div></div>`;
   // Other
@@ -1505,7 +1640,7 @@ function delSN(id){
 }
 function printSN(id){
   const sn=shipNotes.find(n=>n.id===id);if(!sn)return;
-  let rows="";sn.lines.forEach(ln=>{rows+=`<tr><td>${ln.k}</td><td>${ln.eb}</td><td>${ln.name}</td><td>${ln.spec}</td><td>${ln.unit}</td><td>${ln.qty}</td></tr>`;});
+  let rows="";sn.lines.forEach(ln=>{rows+=`<tr><td>${ln.k}</td><td>${ln.eb}</td><td>${ln.name}</td><td>${ln.spec}</td><td>${ln.unit}</td><td>${fmtQty(ln.qty)}</td></tr>`;});
   const html=`<!DOCTYPE html><html><head><meta charset="utf-8"><title>发货单 ${sn.no}</title><style>
 body{font-family:"Microsoft YaHei","SimSun",sans-serif;padding:40px;max-width:800px;margin:0 auto;color:#333}
 h1{text-align:center;font-size:22px;margin-bottom:24px;letter-spacing:4px}
@@ -1718,7 +1853,7 @@ async function listSnapshots(){
         io:its.reduce((s,i)=>s+((i.logs&&i.logs.length)||0),0),
         sn:(p.shipNotes||[]).length,
         cust:(p.customers||[]).length,
-        stock:its.reduce((s,i)=>s+(i.n||0),0)};
+        stock:roundQty(its.reduce((s,i)=>s+(i.n||0),0))};
     }).sort((a,b)=>b.at-a.at);
   }catch(e){return[];}
 }
@@ -1859,7 +1994,7 @@ function rStats(){
   const weekOut=outLogs.filter(l=>l.dt>=weekAgo);
   const monthOut=outLogs.filter(l=>l.dt>=monthStart);
   const yearOut=outLogs.filter(l=>l.dt>=yearStart);
-  const sumQty=arr=>arr.reduce((s,l)=>s+(l.qt||0),0);
+  const sumQty=arr=>roundQty(arr.reduce((s,l)=>s+(l.qt||0),0));
 
   let h=`<div style="padding:16px"><div style="font-size:17px;font-weight:700;color:#fff;margin-bottom:14px">📊 出库统计</div>`;
 
@@ -1902,7 +2037,7 @@ function rStats(){
   if(!topProds.length){h+=`<div style="color:#4b5563;font-size:12px;text-align:center;padding:16px">暂无出库记录</div>`;}
   else{topProds.forEach((p,i)=>{
     const pct=p.qty/topMax*100;const sr=fs(p.item.c);
-    h+=`<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px"><div style="display:flex;align-items:center;gap:6px"><span style="font-size:11px;color:#4b5563;width:18px">#${i+1}</span><span style="font-size:12px;font-weight:600;color:#fff">${p.item.s}</span><span style="font-size:10px;color:${sr.color}">${p.item.c}</span></div><div style="font-size:12px;font-weight:700;color:#e5e7eb">${p.qty} <span style="color:#4b5563;font-weight:400">(${p.count}次)</span></div></div>`;
+    h+=`<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px"><div style="display:flex;align-items:center;gap:6px"><span style="font-size:11px;color:#4b5563;width:18px">#${i+1}</span><span style="font-size:12px;font-weight:600;color:#fff">${p.item.s}</span><span style="font-size:10px;color:${sr.color}">${p.item.c}</span></div><div style="font-size:12px;font-weight:700;color:#e5e7eb">${fmtQty(p.qty)} <span style="color:#4b5563;font-weight:400">(${p.count}次)</span></div></div>`;
     h+=`<div style="height:4px;background:#1e2130;border-radius:2px"><div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#f59e0b,#f97316);border-radius:2px"></div></div></div>`;
   });}
   h+=`</div>`;
@@ -1958,7 +2093,7 @@ function rStats(){
   if(!recent.length){h+=`<div style="color:#4b5563;font-size:12px;text-align:center;padding:16px">暂无出库记录</div>`;}
   else{recent.forEach(l=>{
     const ptag=l.purpose?`<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:${purpColors[l.purpose]||"#374151"}20;color:${purpColors[l.purpose]||"#6b7280"}">${l.purpose}</span>`:"";
-    h+=`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #151821;font-size:12px"><div style="color:#e5e7eb">${l.item.s} <span style="color:#6b7280">${l.item.c}</span> ${ptag}</div><div><span style="color:#f87171;font-weight:600">-${l.qt}</span> <span style="color:#4b5563">${l.dt}</span></div></div>`;
+    h+=`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #151821;font-size:12px"><div style="color:#e5e7eb">${l.item.s} <span style="color:#6b7280">${l.item.c}</span> ${ptag}</div><div><span style="color:#f87171;font-weight:600">-${fmtQty(l.qt)}</span> <span style="color:#4b5563">${l.dt}</span></div></div>`;
   });}
   h+=`</div></div>`;
   return h;
