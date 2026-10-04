@@ -241,14 +241,44 @@ function logKey(lg,idx){
   // 内容指纹：跨设备/跨备份去重都稳定，不受排列顺序影响
   return [lg&&lg.tp,lg&&lg.qt,lg&&lg.dt,(lg&&lg.bt)||"",lg&&lg.pv,lg&&lg.nx].join("_");
 }
-// 判重用四要素：货号+分类+粒径+官能团。
-// 只用货号会出事——实际数据里存在不同产品共用同一货号的情况（如羧基和磺酸基）
-function itemKey(i){
+const APP_VER="2026-10-04 · 按条目编号合并";
+// ═══ 产品条目的身份：每条一个固定编号 uid ═══
+// 以前按「货号+分类+粒径+官能团」判断是不是同一条，同一产品的不同批次就会在同步时被合并成一条。
+// 也不能改成「货号+批号」：入库时批号会更新，同一条的批号会变。
+// 所以给每条一个创建后就不再变的 uid，同步/合并导入都按 uid 认条目。
+// 老数据没有 uid：按原来的四要素算一个确定的 uid（各设备算出来一样），所以升级前后不会多出重复条目。
+function legacyItemKey(i){
   return [String(i.k||"").trim(),String(i.c||"").trim(),String(i.s||"").trim(),String(i.f||"").trim()].join("|");
+}
+function cyrb53(str,seed){
+  let h1=0xdeadbeef^(seed||0),h2=0x41c6ce57^(seed||0);
+  for(let i=0,ch;i<str.length;i++){ch=str.charCodeAt(i);h1=Math.imul(h1^ch,2654435761);h2=Math.imul(h2^ch,1597334677);}
+  h1=Math.imul(h1^(h1>>>16),2246822507)^Math.imul(h2^(h2>>>13),3266489909);
+  h2=Math.imul(h2^(h2>>>16),2246822507)^Math.imul(h1^(h1>>>13),3266489909);
+  return 4294967296*(2097151&h2)+(h1>>>0);
+}
+function legacyUid(i){return "L"+cyrb53(legacyItemKey(i)).toString(36);}
+function newItemUid(){return "R"+Date.now().toString(36)+Math.random().toString(36).slice(2,8);}
+function itemKey(i){
+  if(!i.uid)i.uid=legacyUid(i);
+  return "u:"+i.uid;
+}
+// 给没有 uid 的条目补上；同一份数据里 uid 撞车的，按批号区分，再不行就发新号
+function ensureItemUids(arr){
+  const seen=new Set();
+  (arr||[]).forEach(i=>{
+    if(!i||typeof i!=="object")return;
+    if(!i.uid)i.uid=legacyUid(i);
+    if(seen.has(i.uid))i.uid="L"+cyrb53(legacyItemKey(i)+"#"+(i.b||"")+"#"+(i.eb||"")).toString(36);
+    if(seen.has(i.uid))i.uid=newItemUid();
+    seen.add(i.uid);
+  });
+  return arr;
 }
 
 function mergeWithCloud(cloud){
   // ── 产品 & 出入库记录 ──
+  ensureItemUids(cloud.items);ensureItemUids(items);
   const cMap={},lMap={};
   (cloud.items||[]).forEach(i=>{cMap[itemKey(i)]=i;});
   (items||[]).forEach(i=>{lMap[itemKey(i)]=i;});
@@ -362,7 +392,7 @@ function getLocalSavedAt(){
 }
 
 function applyCloudData(d){
-  items=d.items;allLogs=d.logs||[];pipe=d.pipe||pipe;
+  items=ensureItemUids(d.items);allLogs=d.logs||[];pipe=d.pipe||pipe;
   shipNotes=d.shipNotes||shipNotes||[];
   customers=d.customers||customers||[];
   applySeriesSubs(d.seriesSubs);
@@ -500,7 +530,7 @@ function loadFromStorage(){
   }catch(e){console.error("读取本地数据失败:",e);return false;}
   if(!d||!d.items||!Array.isArray(d.items))return false;
   // 核心数据先加载
-  items=d.items;allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";_savedAt=d.savedAt||0;
+  items=ensureItemUids(d.items);allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";_savedAt=d.savedAt||0;
   // 可选字段单独容错，任何一个出错都不影响主数据
   try{applySeriesSubs(d.seriesSubs);}catch(e){console.error("分类恢复失败:",e);}
   try{
@@ -569,6 +599,7 @@ function importData(){
 function mergeImport(bak){
   const st={newItems:0,newLogs:0,newSN:0,newCust:0,newPipe:0,skipped:0,dupInBak:0};
   // ── 产品 ──
+  ensureItemUids(items);ensureItemUids(bak.items);
   const cur={};
   items.forEach(i=>{cur[itemKey(i)]=i;});
   const addedNow=new Set(); // 本次导入新增的 key，用于识别备份内部重复
@@ -581,8 +612,10 @@ function mergeImport(bak){
       // 备份独有的产品 → 整条补进来
       const ni=Object.assign({},bi);
       ni.id=nextId++;
+      if(cur[k])ni.uid=newItemUid(); // 和现有条目撞号的，换新号，免得下次同步又被并掉
       ni.qc=ni.qc||{};ni.att=ni.att||[];ni.logs=ni.logs||[];
-      items.push(ni);cur[k]=ni;addedNow.add(k);st.newItems++;
+      const nk=itemKey(ni);
+      items.push(ni);cur[nk]=ni;addedNow.add(nk);st.newItems++;
       st.newLogs+=ni.logs.length;
     }else{
       // 已存在 → 库存和字段一概不动，只补历史出入库记录
@@ -663,7 +696,7 @@ function confirmMergeImport(){
 function confirmImport(){
   document.getElementById("importOv").remove();
   const d=window._importData;if(!d)return;
-  items=d.items;allLogs=d.logs||[];pipe=d.pipe||pipe;
+  items=ensureItemUids(d.items);allLogs=d.logs||[];pipe=d.pipe||pipe;
   applySeriesSubs(d.seriesSubs);
   // 关键：出库单和客户档案也要恢复
   if(Array.isArray(d.shipNotes))shipNotes=d.shipNotes;
@@ -707,6 +740,7 @@ if(!loadFromStorage()){
   items=RAW.map((d,i)=>({id:i,c:d.c,s:d.s,f:d.f,m:d.m,k:d.k,b:d.b,q:d.q,n:d.n,t:d.t,o:d.o,ln:d.ln||"1",eb:d.eb||"",pr:d.pr||"",spec:d.spec||"",qc:{},logs:[],att:[]}));
   // Auto-generate external batch for items without one
   items.forEach(d=>{if(!d.eb&&d.b)d.eb=genExtBatch(d.c,d.b,d.ln);});
+  ensureItemUids(items);
   allLogs=[];
   pipe=[
     {id:1,nm:"PET纳米微球多规格攻关",pr:"P0",ph:"Week 1-2",st:"进行中",tg:"300-500nm+500-1μm",nt:"50/100nm已就绪"},
@@ -1211,7 +1245,7 @@ function doAdd(){
   if(!data){alert("请填写产品分类和粒径/规格");return;}
   // Auto-gen external batch if empty
   if(!data.eb&&data.b)data.eb=genExtBatch(data.c,data.b,data.ln);
-  const newItem={id:nextId++,...data,q:String(data.n),qc:{},logs:[],att:[]};
+  const newItem={id:nextId++,uid:newItemUid(),...data,q:String(data.n),qc:{},logs:[],att:[]};
   items.push(newItem);
   const sr=fs(data.c);
   if(!sr.sub.includes(data.c)){SERIES[0].sub.push(data.c);}
@@ -2112,7 +2146,7 @@ function rSync(){
   h+=`<div><div style="font-size:18px;font-weight:700;color:#fff">${pipe.length}</div><div style="color:#6b7280">研发项目</div></div>`;
   h+=`<div><div style="font-size:18px;font-weight:700;color:#fff">${allLogs.length}</div><div style="color:#6b7280">操作记录</div></div>`;
   h+=`</div>`;
-  h+=`<div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e2130;font-size:10px;color:#6b7280">上次同步: ${lastSync||"尚未保存"} · ${dataSize} KB</div></div>`;
+  h+=`<div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e2130;font-size:10px;color:#6b7280">上次同步: ${lastSync||"尚未保存"} · ${dataSize} KB<br>程序版本: ${APP_VER}</div></div>`;
 
   if(!hasSB){
     h+=`<div class="card" style="cursor:default;border-color:#6366f1"><div style="font-size:13px;font-weight:600;color:#34d399;margin-bottom:10px">⚡ 配置 Supabase（一次性，5分钟）</div>`;
