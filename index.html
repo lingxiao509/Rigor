@@ -241,14 +241,62 @@ function logKey(lg,idx){
   // 内容指纹：跨设备/跨备份去重都稳定，不受排列顺序影响
   return [lg&&lg.tp,lg&&lg.qt,lg&&lg.dt,(lg&&lg.bt)||"",lg&&lg.pv,lg&&lg.nx].join("_");
 }
-// 判重用四要素：货号+分类+粒径+官能团。
-// 只用货号会出事——实际数据里存在不同产品共用同一货号的情况（如羧基和磺酸基）
-function itemKey(i){
+const APP_VER="2026-10-04 · 按条目编号合并";
+// ═══ 产品条目的身份：每条一个固定编号 uid ═══
+// 以前按「货号+分类+粒径+官能团」判断是不是同一条，同一产品的不同批次就会在同步时被合并成一条。
+// 也不能改成「货号+批号」：入库时批号会更新，同一条的批号会变。
+// 所以给每条一个创建后就不再变的 uid，同步/合并导入都按 uid 认条目。
+// 老数据没有 uid：按原来的四要素算一个确定的 uid（各设备算出来一样），所以升级前后不会多出重复条目。
+function legacyItemKey(i){
   return [String(i.k||"").trim(),String(i.c||"").trim(),String(i.s||"").trim(),String(i.f||"").trim()].join("|");
+}
+function cyrb53(str,seed){
+  let h1=0xdeadbeef^(seed||0),h2=0x41c6ce57^(seed||0);
+  for(let i=0,ch;i<str.length;i++){ch=str.charCodeAt(i);h1=Math.imul(h1^ch,2654435761);h2=Math.imul(h2^ch,1597334677);}
+  h1=Math.imul(h1^(h1>>>16),2246822507)^Math.imul(h2^(h2>>>13),3266489909);
+  h2=Math.imul(h2^(h2>>>16),2246822507)^Math.imul(h1^(h1>>>13),3266489909);
+  return 4294967296*(2097151&h2)+(h1>>>0);
+}
+function legacyUid(i){return "L"+cyrb53(legacyItemKey(i)).toString(36);}
+function newItemUid(){return "R"+Date.now().toString(36)+Math.random().toString(36).slice(2,8);}
+function itemKey(i){
+  if(!i.uid)i.uid=legacyUid(i);
+  return "u:"+i.uid;
+}
+// 给没有 uid 的条目补上；同一份数据里 uid 撞车的，按批号区分，再不行就发新号
+function ensureItemUids(arr){
+  const seen=new Set();
+  (arr||[]).forEach(i=>{
+    if(!i||typeof i!=="object")return;
+    if(!i.uid)i.uid=legacyUid(i);
+    if(seen.has(i.uid))i.uid="L"+cyrb53(legacyItemKey(i)+"#"+(i.b||"")+"#"+(i.eb||"")).toString(36);
+    if(seen.has(i.uid))i.uid=newItemUid();
+    seen.add(i.uid);
+  });
+  return arr;
+}
+// ═══ 每条的最后修改时间 mt ═══
+// 同步合并时，两边都有这条：文本字段（货号/型号/批号/备注…）取 mt 较新的一边；都没有 mt 时仍以本机为准（老规则）。
+// 不在每个编辑入口单独记时间，而是在 saveState 时对比每条的内容签名，变了就记 mt，任何改动路径都不会漏。
+const SIG_SKIP={id:1,n:1,q:1,t:1,logs:1,att:1,mt:1}; // 库存数/记录/附件另有合并规则
+function itemSig(i){const o={};Object.keys(i).sort().forEach(k=>{if(!SIG_SKIP[k])o[k]=i[k];});return JSON.stringify(o);}
+let _itemSigs={};
+function rebaseItemSigs(){_itemSigs={};(items||[]).forEach(i=>{if(i&&i.uid)_itemSigs[i.uid]=itemSig(i);});}
+function stampItemEdits(){
+  const now=Date.now(),next={};
+  (items||[]).forEach(i=>{
+    if(!i||typeof i!=="object")return;
+    if(!i.uid)i.uid=newItemUid();
+    const s=itemSig(i),p=_itemSigs[i.uid];
+    if(p===undefined){if(!i.mt)i.mt=now;}else if(p!==s)i.mt=now;
+    next[i.uid]=s;
+  });
+  _itemSigs=next;
 }
 
 function mergeWithCloud(cloud){
   // ── 产品 & 出入库记录 ──
+  ensureItemUids(cloud.items);ensureItemUids(items);
   const cMap={},lMap={};
   (cloud.items||[]).forEach(i=>{cMap[itemKey(i)]=i;});
   (items||[]).forEach(i=>{lMap[itemKey(i)]=i;});
@@ -268,7 +316,8 @@ function mergeWithCloud(cloud){
     onlyLocal.forEach(lg=>{n+=(lg.tp==="in"?(lg.qt||0):-(lg.qt||0));});
     n=roundQty(Math.max(0,n));
     if(onlyLocal.length)recovered+=onlyLocal.length;
-    const base=Object.assign({},c,l); // 文本字段以本地（当前设备刚编辑的）为准
+    // 文本字段取最后修改的一边；两边都没有修改时间（老数据）时以本地为准
+    const base=(l.mt||0)>=(c.mt||0)?Object.assign({},c,l):Object.assign({},l,c);
     base.n=n;
     base.logs=cLogs.concat(onlyLocal);
     base.q=String(n);
@@ -331,6 +380,7 @@ async function reconcileOnConnect(){
     // 合并
     const m=mergeWithCloud(cloud);
     items=m.items;shipNotes=m.shipNotes;customers=m.customers;pipe=m.pipe;allLogs=m.logs;
+    rebaseItemSigs();
     if(m.seriesSubs)applySeriesSubs(m.seriesSubs);
     nextId=items.length;
     snNextId=shipNotes.length?Math.max(...shipNotes.map(n=>n.id||0))+1:1;
@@ -362,7 +412,7 @@ function getLocalSavedAt(){
 }
 
 function applyCloudData(d){
-  items=d.items;allLogs=d.logs||[];pipe=d.pipe||pipe;
+  items=ensureItemUids(d.items);rebaseItemSigs();allLogs=d.logs||[];pipe=d.pipe||pipe;
   shipNotes=d.shipNotes||shipNotes||[];
   customers=d.customers||customers||[];
   applySeriesSubs(d.seriesSubs);
@@ -453,6 +503,7 @@ function saveState(){
   const seriesSubs=getSeriesSubs();
   _localVer++; // 每次改动版本号+1，标记为脏
   _savedAt=Date.now();
+  try{stampItemEdits();}catch(e){console.error("记录修改时间失败:",e);}
   try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs,lastSync,shipNotes,customers,savedAt:_savedAt}));}catch(e){}
   _lastFingerprint=fingerprint(); // 更新兜底快照基线
   if(sbConnected)pushToCloud();
@@ -486,6 +537,7 @@ window.addEventListener("beforeunload",()=>{
   try{
     const fp=fingerprint();
     if(fp!==_lastFingerprint){
+      try{stampItemEdits();}catch(e){}
       localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers,savedAt:Date.now()}));
     }
   }catch(e){}
@@ -500,7 +552,7 @@ function loadFromStorage(){
   }catch(e){console.error("读取本地数据失败:",e);return false;}
   if(!d||!d.items||!Array.isArray(d.items))return false;
   // 核心数据先加载
-  items=d.items;allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";_savedAt=d.savedAt||0;
+  items=ensureItemUids(d.items);rebaseItemSigs();allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";_savedAt=d.savedAt||0;
   // 可选字段单独容错，任何一个出错都不影响主数据
   try{applySeriesSubs(d.seriesSubs);}catch(e){console.error("分类恢复失败:",e);}
   try{
@@ -512,6 +564,99 @@ function loadFromStorage(){
     custNextId=customers.length?Math.max(...customers.map(c=>c.id||0))+1:1;
   }catch(e){console.error("客户档案恢复失败:",e);customers=[];custNextId=1;}
   return true;
+}
+
+// ═══ 货号更正（2026-10-04）═══
+// 一次性更正（在「同步」页点按钮）：第 1 轮 PET/PP 改码、补 PA6/PLA 等常备档；第 2 轮更正写错的货号、给没货号的批次补码、两个染色分类合并。
+// 每条规则按内容（分类+粒径+官能团+货号+批号）定位，必须恰好匹配 1 条才改；字段只在仍是原值时才改，别处改过的不动。
+// 已经改过的再点也不会重复改。库存数量、出入库记录、出库单、客户都不动。
+const FIX_20261004={"rules":[{"r":1,"m":{"c":"PET微球","s":"50nm-300nm","f":"","k":"PET01N050NA","b":"20250718"},"set":{"k":["PET01N050NA","PETN050"],"m":["PET01005","PETN050"],"s":["50nm-300nm","50nm"],"b":["20250718","20251210"],"eb":[null,"PL5101"],"spec":["","10mL 10mg/mL"]},"note":"旧货号 PET01N050NA / 旧型号 PET01005；2026-10-04 按原始记录恢复粒径和批号（曾误写成 50–300 nm / 20250718）","id":98},{"r":1,"m":{"c":"PET微球","s":"80nm","f":"","k":"PET01N080NA","b":"20250818"},"set":{"k":["PET01N080NA","PETN080"],"m":["PET01008","PETN080"],"spec":["","10mL 10mg/mL"]},"note":"旧货号 PET01N080NA / 旧型号 PET01008","id":99},{"r":1,"m":{"c":"PET微球","s":"100nm","f":"","k":"PET01N100NA","b":"20251023"},"set":{"k":["PET01N100NA","PETN100"],"m":["PET01010","PETN100"],"spec":["","10mL 10mg/mL"]},"note":"旧货号 PET01N100NA / 旧型号 PET01010","id":100},{"r":1,"m":{"c":"PET微球","s":"150nm","f":"","k":"PET01N150NA","b":""},"set":{"k":["PET01N150NA","PETN150"],"m":["PET01015","PETN150"],"spec":["","10mL 10mg/mL"]},"note":"旧货号 PET01N150NA / 旧型号 PET01015","id":101},{"r":1,"m":{"c":"PET微球","s":"200nm","f":"","k":"PET01N200NA","b":""},"set":{"k":["PET01N200NA","PETN200"],"m":["PET01020","PETN200"],"spec":["","10mL 10mg/mL"]},"note":"旧货号 PET01N200NA / 旧型号 PET01020","id":102},{"r":1,"m":{"c":"PET微球","s":"500nm","f":"","k":"PET01N500NA","b":""},"set":{"k":["PET01N500NA","PETN500"],"m":["PET01050","PETN500"],"spec":["","10mL 10mg/mL"]},"note":"旧货号 PET01N500NA / 旧型号 PET01050","id":103},{"r":1,"m":{"c":"PET微球","s":"1000nm/1um","f":"","k":"PET01U001NA","b":""},"set":{"k":["PET01U001NA","PETU001"],"m":["PET02010","PETU001"],"spec":["","10mL 10mg/mL"]},"note":"旧货号 PET01U001NA / 旧型号 PET02010","id":104},{"r":1,"m":{"c":"PET微球","s":"5um","f":"","k":"PET01U005NA","b":""},"set":{"k":["PET01U005NA","PETU005"],"m":["PET02050","PETU005"],"spec":["","10mL 10mg/mL"]},"note":"旧货号 PET01U005NA / 旧型号 PET02050","id":105},{"r":1,"m":{"c":"PET微球","s":"10um","f":"","k":"PET01U010NA","b":""},"set":{"k":["PET01U010NA","PETU010"],"m":["PET02100","PETU010"],"spec":["","10mL 10mg/mL"]},"note":"旧货号 PET01U010NA / 旧型号 PET02100","id":106},{"r":1,"m":{"c":"PE微球","s":"待定","f":"","k":"PE01NA","b":""},"set":{"spec":["","10mL 10mg/mL"]},"note":"PE 开发项，先确认是否 LDPE；LDPE 常备档见 LDPEN300 … LDPEU010","id":383},{"r":1,"m":{"c":"PP微球","s":"待定","f":"","k":"PP01NA","b":""},"set":{"spec":["","10mL 10mg/mL"]},"note":"研发占位；常备档见 PPN300 … PPU010","id":384},{"r":1,"m":{"c":"PVC微球","s":"多规格","f":"","k":"PVC01NA","b":"20260201"},"set":{"spec":["","10mL 10mg/mL"]},"note":"多规格库存，按实测拆分转入 PVCN300 … PVCU010","id":385},{"r":1,"m":{"c":"PET微球","s":"100nm","f":"绿色荧光","k":"","b":"20251121"},"set":{"spec":[null,"10mL 10mg/mL"]},"note":"绿色荧光 PET：荧光宽分布材料的编码规则未定，暂不编码","id":393},{"r":1,"m":{"c":"PET微球","s":"50nm-300nm","f":"","k":"PET01N053NA","b":"20250718"},"set":{"spec":["","10mL 10mg/mL"]},"note":"50–300 nm 范围条目，待测 Z-均后定码","id":424},{"r":1,"m":{"c":"PVC微球","s":"1-10um","f":"无SDS","k":"","b":"20260724-2"},"set":{},"note":"1–10 µm 范围，待图像法测数均径后归入 PVCU001 / U002 / U005 / U010","id":444},{"r":1,"m":{"c":"PP微球","s":"500nm","f":"无sds","k":"","b":"20260723"},"set":{"k":["","PPN500"],"m":["","PPN500"]},"note":"批号 PG6231 曾分别按 300 nm（日本 DR001）和 500 nm（泰国 DR003）发货，待实测 Z-均确认档位","id":445},{"r":1,"m":{"c":"LDPE微球","s":"300-500nm","f":"无SDS","k":"","b":"20260723-2"},"set":{},"note":"300–500 nm 范围，待测 Z-均后归入 LDPEN300 或 LDPEN500","id":446},{"r":2,"m":{"c":"PMMA荧光微球(橙红)","s":"600nm","f":"","k":"PS01N600NA","b":"20211214"},"set":{"k":["PS01N600NA","FA01N600O"]},"note":"旧货号 PS01N600NA（2026-10-04 更正：原码是 PS 白球的码，按 PMMA 橙红荧光编码）","id":10},{"r":2,"m":{"c":"PS微球","s":"2.5um","f":"","k":"PS01U025NA","b":"20211115"},"set":{"k":["PS01U025NA","PS01U002P5NA"]},"note":"旧货号 PS01U025NA（2026-10-04 更正：U025 是 25 µm，2.5 µm 按小数 P 写法）","id":27},{"r":2,"m":{"c":"功能化PS微球","s":"100nm","f":"磺酸基-S","k":"PS02N100NA","b":"20240426"},"set":{"k":["PS02N100NA","PS05N100NA"]},"note":"旧货号 PS02N100NA（2026-10-04 更正：磺酸基是 05，02 是羧基）","id":112},{"r":2,"m":{"c":"功能化PS微球","s":"10um","f":"磺酸基-S","k":"PS02U010NA","b":"20201123"},"set":{"k":["PS02U010NA","PS05U010NA"]},"note":"旧货号 PS02U010NA（2026-10-04 更正：磺酸基是 05，02 是羧基）","id":139},{"r":2,"m":{"c":"功能化PS微球","s":"2um （PMMA）","f":"羧基-COOH","k":"","b":"20220315"},"set":{"k":["","PA02U002NA"],"m":["","PA02U002NA"]},"note":"","id":160},{"r":2,"m":{"c":"功能化PS微球","s":"1um PGMA","f":"环氧-EP","k":"","b":""},"set":{"k":["","PG01U001EP"],"m":["","PG01U001EP"]},"note":"","id":161},{"r":2,"m":{"c":"功能化PS微球","s":"1.5um","f":"磺酸基-S","k":"","b":"20210721"},"set":{"k":["","PS05U0015NA"],"m":["","PS05U0015NA"]},"note":"","id":162},{"r":2,"m":{"c":"功能化PS微球","s":"9um","f":"季铵基-NH4+","k":"","b":""},"set":{"k":["","PS06U009NA"],"m":["","PS06U009NA"]},"note":"","id":163},{"r":2,"m":{"c":"PS荧光微球(橙红)","s":"2um","f":"羧基-COOH","k":"FS01U002O","b":"20250615-2"},"set":{"k":["FS01U002O","FS02U002O"]},"note":"旧货号 FS01U002O（2026-10-04 更正：羧基是 02）","id":208},{"r":2,"m":{"c":"PS荧光微球(橙红)","s":"80nm","f":"无","k":"FS01U007O","b":"20210712"},"set":{},"note":"待确认：粒径写 80 nm，但货号和型号都是 7 µm，确认哪个对","id":223},{"r":2,"m":{"c":"PS荧光微球(蓝)","s":"50nm","f":"氨基-NH2","k":"FS01N050B","b":"20260324"},"set":{"k":["FS01N050B","FS03N050B"]},"note":"旧货号 FS01N050B（2026-10-04 更正：氨基是 03）","id":232},{"r":2,"m":{"c":"PMMA荧光微球(蓝)","s":"200um","f":"","k":"PS01U200B","b":""},"set":{},"note":"待确认：在 PMMA 蓝色荧光分类下，但货号/型号是 PS 白球 200 µm，确认材质和分类","id":250},{"r":2,"m":{"c":"PMMA荧光微球(绿)","s":"50nm","f":"羧基-COOH","k":"FA02N005G","b":"20230219"},"set":{"k":["FA02N005G","FA02N050G"]},"note":"旧货号 FA02N005G（2026-10-04 更正：粒径码写成了 5 nm）","id":277},{"r":2,"m":{"c":"PMMA荧光微球(绿)","s":"400nm","f":"无","k":"FA01N040G","b":"20211229"},"set":{"k":["FA01N040G","FA01N400G"]},"note":"旧货号 FA01N040G（2026-10-04 更正：粒径码写成了 40 nm）","id":278},{"r":2,"m":{"c":"PMMA荧光微球(绿)","s":"200nm","f":"羧基-COOH","k":"FA02N020G","b":"20220407"},"set":{"k":["FA02N020G","FA02N200G"]},"note":"旧货号 FA02N020G（2026-10-04 更正：粒径码写成了 20 nm）","id":279},{"r":2,"m":{"c":"PMMA荧光微球(橙红)","s":"20um","f":"氨基-NH2","k":"FA03N020O","b":"20210510"},"set":{"k":["FA03N020O","FA03U020O"]},"note":"旧货号 FA03N020O（2026-10-04 更正：20 µm 应为 U020，写成了 20 nm）","id":300},{"r":2,"m":{"c":"染色PS微球","s":"50nm","f":"无 蓝色","k":"CS01N050B","b":"20231113-2"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":321},{"r":2,"m":{"c":"染色PS微球","s":"50nm","f":"无 红色","k":"CS01N050R","b":"20231113-3"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":322},{"r":2,"m":{"c":"染色PS微球","s":"50nm","f":"无 黑色（偏紫）","k":"CS01N050BL","b":"20231113-4"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":323},{"r":2,"m":{"c":"染色PS微球","s":"100nm","f":"无 红色","k":"CS01N100R","b":"20260115"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":324},{"r":2,"m":{"c":"染色PS微球","s":"200nm","f":"无 蓝色","k":"CS01N200B","b":"20260112"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":325},{"r":2,"m":{"c":"染色微球","s":"500nm","f":"黑色","k":"CS01N500G","b":"20260627"},"set":{},"note":"待确认：官能团栏写黑色，但货号/型号末位 G，确认颜色","id":326},{"r":2,"m":{"c":"染色PS微球","s":"1000nm/1um","f":"无","k":"CS01U001G","b":""},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":327},{"r":2,"m":{"c":"染色PS微球","s":"2um","f":"无 红色","k":"CS01U002R","b":"20250616"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":328},{"r":2,"m":{"c":"染色PS微球","s":"5um","f":"无 蓝色","k":"CS01U005B","b":"20231113-1"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":330},{"r":2,"m":{"c":"染色PS微球","s":"5um","f":"无 红色","k":"CS01U005R","b":"20231113-2"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":331},{"r":2,"m":{"c":"染色PS微球","s":"5um","f":"无 黑色","k":"CS01U005BL","b":"20251101"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":332},{"r":2,"m":{"c":"染色PS微球","s":"10um","f":"无","k":"CS01U010G","b":""},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":333},{"r":2,"m":{"c":"染色PS微球","s":"10um","f":"氨基-NH2 蓝色","k":"CS03U010B","b":"20250305"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":334},{"r":2,"m":{"c":"染色PS微球","s":"10um","f":"黑色","k":"CS01U010BL","b":"20251109-1"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":335},{"r":2,"m":{"c":"染色PS微球","s":"15um","f":"羧基-COOH 红色","k":"CS02U015R","b":"20241114"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":336},{"r":2,"m":{"c":"染色PS微球","s":"20um","f":"无 蓝色","k":"CS01U020B","b":"20230510"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":337},{"r":2,"m":{"c":"染色PS微球","s":"20um","f":"无 红色","k":"CS01U020R","b":"20230506"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":338},{"r":2,"m":{"c":"染色PS微球","s":"20um","f":"无 黑色","k":"CS01U020BL","b":"20250910"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":339},{"r":2,"m":{"c":"染色PS微球","s":"30um","f":"无","k":"CS01U030G","b":""},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":340},{"r":2,"m":{"c":"染色PS微球","s":"40um","f":"无","k":"CS01U040G","b":""},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":341},{"r":2,"m":{"c":"染色PS微球","s":"100um","f":"无 黑色","k":"CS01U100B","b":"20240724"},"set":{"k":["CS01U100B","CS01U100BL"],"c":["染色PS微球","染色微球"]},"note":"旧货号 CS01U100B（2026-10-04 更正：黑色统一写 BL（B 是蓝色））","id":343},{"r":2,"m":{"c":"染色PS微球","s":"500um","f":"无 黑色","k":"CS01U500B","b":"20250407"},"set":{"k":["CS01U500B","CS01U500BL"],"c":["染色PS微球","染色微球"]},"note":"旧货号 CS01U500B（2026-10-04 更正：黑色统一写 BL（B 是蓝色））","id":344},{"r":2,"m":{"c":"染色PS微球","s":"600um","f":"无 红色","k":"CS01U600R","b":"20240313"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":345},{"r":2,"m":{"c":"染色PS微球","s":"300nm","f":"羧基-COOH 红色","k":"CS02U0103R","b":"20220419"},"set":{"k":["CS02U0103R","CS02N300R"],"c":["染色PS微球","染色微球"]},"note":"旧货号 CS02U0103R（2026-10-04 更正：粒径码格式错，300 nm 为 N300）","id":346},{"r":2,"m":{"c":"染色PS微球","s":"2um","f":"羧基-COOH 红色","k":"CS02U0202R","b":"20231222"},"set":{"k":["CS02U0202R","CS02U002R"],"c":["染色PS微球","染色微球"]},"note":"旧货号 CS02U0202R（2026-10-04 更正：粒径码格式错，2 µm 为 U002）","id":347},{"r":2,"m":{"c":"染色PS微球","s":"7um","f":"无 红色","k":"CS01U007R","b":"20240620"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":348},{"r":2,"m":{"c":"染色PS微球","s":"1000um","f":"无 蓝色","k":"CS01U1K0B","b":"20230926"},"set":{"k":["CS01U1K0B","CS01U01KB"],"c":["染色PS微球","染色微球"]},"note":"旧货号 CS01U1K0B（2026-10-04 更正：1000 µm 统一写 U01K（同 PS01U01KNA））","id":349},{"r":2,"m":{"c":"染色微球","s":"3um","f":"黑色","k":"CS01U003BL","b":"20251014-1"},"set":{"k":["CS01U003BL","CA01U003BL"]},"note":"旧货号 CS01U003BL（2026-10-04 更正：型号写的是 PMMA（UCPMMA0203BL））","id":350},{"r":2,"m":{"c":"染色PS微球","s":"10um","f":"无 紫色","k":"FS01U010P","b":"20251029-3"},"set":{"k":["FS01U010P","CS01U010P"],"c":["染色PS微球","染色微球"]},"note":"旧货号 FS01U010P（2026-10-04 更正：在染色分类，同批另一条也登记为紫色染色；荧光线只有绿/橙红/蓝）","id":351},{"r":2,"m":{"c":"染色PS微球","s":"100um","f":"无 红色","k":"CS01U100R","b":"20251029-2"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":352},{"r":2,"m":{"c":"磁性微球","s":"300nm","f":"无 四氧化三铁","k":"MF01N200NA","b":"20250403-2"},"set":{},"note":"待确认：粒径写 300 nm，但货号和型号都是 200 nm，确认哪个对","id":356},{"r":2,"m":{"c":"磁性微球","s":"800nm","f":"羧基 四氧化三铁","k":"MF01N800NA","b":"20251103"},"set":{"k":["MF01N800NA","MF02N800NA"]},"note":"旧货号 MF01N800NA（2026-10-04 更正：羧基是 02）","id":360},{"r":2,"m":{"c":"磁性微球","s":"1000nm","f":"无 四氧化三铁","k":"MF01N01KNA","b":"20250901"},"set":{"k":["MF01N01KNA","MF01U001NA"]},"note":"旧货号 MF01N01KNA（2026-10-04 更正：1000 nm 即 1 µm，写 U001）","id":361},{"r":2,"m":{"c":"磁性微球","s":"400um","f":"羧基 聚苯乙烯磁性","k":"MS01U400NA","b":"20240627"},"set":{"k":["MS01U400NA","MS02U400NA"]},"note":"旧货号 MS01U400NA（2026-10-04 更正：羧基是 02）","id":378},{"r":2,"m":{"c":"磁性微球","s":"30um","f":"无 聚苯乙烯磁性","k":"MS01U035NA","b":"20210821"},"set":{},"note":"待确认：粒径写 30 µm，但货号和型号都是 35 µm，确认哪个对","id":381},{"r":2,"m":{"c":"染色微球","s":"5um","f":"黑色","k":"","b":"20251109-2"},"set":{"k":["","CS01U005BL"],"m":["","CS01U005BL"]},"note":"","id":391},{"r":2,"m":{"c":"PS荧光微球(蓝)","s":"100nm","f":"羧基-COOH","k":"","b":"20241125"},"set":{"k":["","FS02N100B"],"m":["","FS02N100B"]},"note":"","id":392},{"r":2,"m":{"c":"PS微球","s":"500um","f":"","k":"","b":"20240512"},"set":{"k":["","PS01U500NA"],"m":["","PS01U500NA"]},"note":"","id":394},{"r":2,"m":{"c":"PS微球","s":"1600um","f":"","k":"","b":"20240906"},"set":{},"note":"待确认：没有货号：1600 µm 的粒径码怎么写（1 mm、2 mm 现为 U01K、U02K）","id":395},{"r":2,"m":{"c":"PS微球","s":"5um","f":"","k":"","b":"20241125"},"set":{"k":["","PS01U005NA"],"m":["","PS01U005NA"]},"note":"","id":396},{"r":2,"m":{"c":"PS微球","s":"130um","f":"","k":"","b":"20251124"},"set":{"k":["","PS01U130NA"],"m":["","PS01U130NA"]},"note":"","id":397},{"r":2,"m":{"c":"染色微球","s":"10um","f":"紫色","k":"","b":"20251029-3"},"set":{"k":["","CS01U010P"],"m":["","CS01U010P"]},"note":"","id":398},{"r":2,"m":{"c":"染色微球","s":"1000um","f":"红色","k":"","b":"20260305"},"set":{"k":["","CS01U01KR"],"m":["","CS01U01KR"]},"note":"","id":399},{"r":2,"m":{"c":"磁性微球","s":"500um","f":"硅羟基-SH","k":"MS01U500NASH","b":"20230523"},"set":{},"note":"待确认：硅羟基/巯基还没有官能团编号，先保留","id":403},{"r":2,"m":{"c":"磁性微球","s":"500um","f":"羧基-cooh","k":"MS01U500NACM","b":"20230712"},"set":{"k":["MS01U500NACM","MS02U500NA"]},"note":"旧货号 MS01U500NACM（2026-10-04 更正：羧基写在 02 位，去掉末尾 CM）","id":404},{"r":2,"m":{"c":"PMMA荧光微球(橙红)","s":"100nm","f":"红色","k":"","b":"20260408-1"},"set":{"k":["","FA01N100O"],"m":["","FA01N100O"]},"note":"","id":407},{"r":2,"m":{"c":"PMMA荧光微球(橙红)","s":"2um","f":"红色","k":"","b":"20260408-1"},"set":{"k":["","FA01U002O"],"m":["","FA01U002O"]},"note":"","id":408},{"r":2,"m":{"c":"染色微球","s":"200nm","f":"pmma蓝色","k":"","b":"20260425"},"set":{"k":["","CA01N200B"],"m":["","CA01N200B"]},"note":"","id":410},{"r":2,"m":{"c":"磁性微球","s":"800nm","f":"氨基","k":"","b":"20260427"},"set":{"k":["","MF03N800NA"],"m":["","MF03N800NA"]},"note":"","id":411},{"r":2,"m":{"c":"功能化PS微球","s":"400um","f":"羧基-COOH","k":"PS04000CM","b":"20260623"},"set":{"k":["PS04000CM","PS02U400NA"]},"note":"旧货号 PS04000CM（2026-10-04 更正：货号格式错，按型号 PS02U400NA）","id":412},{"r":2,"m":{"c":"染色微球","s":"100nm","f":"pmma-深蓝色","k":"","b":"20260511"},"set":{"k":["","CA01N100DB"],"m":["","CA01N100DB"]},"note":"","id":414},{"r":2,"m":{"c":"生物磁珠","s":"1um","f":"蛋白A/G","k":"","b":""},"set":{"k":["","BM01-AG-1UM"],"m":["","BM01-AG-1UM"]},"note":"","id":416},{"r":2,"m":{"c":"PS微球","s":"350um","f":"","k":"","b":"20250114-2"},"set":{"k":["","PS01U350NA"],"m":["","PS01U350NA"]},"note":"","id":417},{"r":2,"m":{"c":"PS荧光微球(绿)","s":"50nm","f":"羧基","k":"","b":"20260705"},"set":{"k":["","FS02N050G"],"m":["","FS02N050G"]},"note":"","id":418},{"r":2,"m":{"c":"功能化PS微球","s":"8um","f":"季铵基-NH4+","k":"","b":""},"set":{"k":["","PS06U008NA"],"m":["","PS06U008NA"]},"note":"","id":419},{"r":2,"m":{"c":"生物磁珠","s":"1um","f":"链霉亲和素","k":"","b":""},"set":{"k":["","BM01-SA-1UM"],"m":["","BM01-SA-1UM"]},"note":"","id":420},{"r":2,"m":{"c":"染色微球","s":"20um","f":"黑色","k":"","b":"20221011"},"set":{"k":["","CS01U020BL"],"m":["","CS01U020BL"]},"note":"","id":421},{"r":2,"m":{"c":"PS荧光微球(蓝)","s":"1um","f":"羧基-COOH","k":"","b":"20260129-2"},"set":{"k":["","FS02U001B"],"m":["","FS02U001B"]},"note":"","id":422},{"r":2,"m":{"c":"功能化PS微球","s":"1um","f":"磺酸基 -HSO3","k":"","b":"20240428"},"set":{"k":["","PS05U001NA"],"m":["","PS05U001NA"]},"note":"","id":423},{"r":2,"m":{"c":"功能化PS微球","s":"2um (PMMA)","f":"羧基-COOH","k":"PA02U002CM","b":"20220315"},"set":{"k":["PA02U002CM","PA02U002NA"]},"note":"旧货号 PA02U002CM（2026-10-04 更正：官能团已在 02 位，末位写 NA）","id":426},{"r":2,"m":{"c":"功能化PS微球","s":"50nm(PMMA)","f":"羧基-COOH","k":"PA02N050CM","b":"20220329"},"set":{"k":["PA02N050CM","PA02N050NA"]},"note":"旧货号 PA02N050CM（2026-10-04 更正：官能团已在 02 位，末位写 NA）","id":430},{"r":2,"m":{"c":"功能化PS微球","s":"6um","f":"羧基-COOH","k":"PS02U006CM","b":"20240126"},"set":{"k":["PS02U006CM","PS02U006NA"]},"note":"旧货号 PS02U006CM（2026-10-04 更正：官能团已在 02 位，末位写 NA）","id":431},{"r":2,"m":{"c":"染色PS微球","s":"2um","f":"黑色","k":"CS01U002BK","b":"20260120"},"set":{"k":["CS01U002BK","CS01U002BL"],"c":["染色PS微球","染色微球"]},"note":"旧货号 CS01U002BK（2026-10-04 更正：黑色统一写 BL）","id":434},{"r":2,"m":{"c":"染色PS微球","s":"10um","f":"蓝色","k":"CS01U010B","b":"20250521"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":435},{"r":2,"m":{"c":"染色PS微球","s":"2um","f":"黑色","k":"CA01U002BL","b":"20250906"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":436},{"r":2,"m":{"c":"染色PS微球","s":"5um","f":"黑色","k":"CA01U005BL","b":"20251111"},"set":{"c":["染色PS微球","染色微球"]},"note":"","id":437},{"r":2,"m":{"c":"染色PS微球","s":"50um","f":"无 蓝色","k":"CS01U050BU","b":"20251029-1"},"set":{"k":["CS01U050BU","CS01U050B"],"c":["染色PS微球","染色微球"]},"note":"旧货号 CS01U050BU（2026-10-04 更正：蓝色统一写 B）","id":438},{"r":2,"m":{"c":"染色微球","s":"100um 黑色","f":"羧基-COOH","k":"CS01U100BCM","b":"20260727"},"set":{"k":["CS01U100BCM","CS02U100BL"]},"note":"旧货号 CS01U100BCM（2026-10-04 更正：羧基写在 02 位；黑色写 BL）","id":443},{"r":2,"m":{"c":"功能化PS微球","s":"100nm","f":"羧基-COOH","k":"PS01010CM","b":"20210807"},"set":{"k":["PS01010CM","PS02N100NA"]},"note":"旧货号 PS01010CM（2026-10-04 更正：货号格式错，按型号 PS02N100NA）","id":451},{"r":2,"m":{"c":"功能化PS微球","s":"50nm(PMMA）","f":"羧基-COOH","k":"","b":"20220329"},"set":{"k":["","PA02N050NA"],"m":["","PA02N050NA"]},"note":"","id":452},{"r":2,"m":{"c":"功能化PS微球","s":"6um","f":"羧基-COOH","k":"","b":""},"set":{"k":["","PS02U006NA"],"m":["","PS02U006NA"]},"note":"","id":453},{"r":2,"m":{"c":"功能化PS微球","s":"20um","f":"磺酸基 -HSO3","k":"","b":"20240427"},"set":{"k":["","PS05U020NA"],"m":["","PS05U020NA"]},"note":"","id":454},{"r":2,"m":{"c":"染色微球","s":"100um","f":"黑色","k":"CS01U100Bl","b":"20260730"},"set":{"k":["CS01U100Bl","CS01U100BL"]},"note":"旧货号 CS01U100Bl（2026-10-04 更正：小写 l 改大写）","id":469},{"r":2,"m":{"c":"染色微球","s":"500um","f":"黑色","k":"CS01U500B","b":"20250407"},"set":{"k":["CS01U500B","CS01U500BL"]},"note":"旧货号 CS01U500B（2026-10-04 更正：黑色统一写 BL（B 是蓝色））","id":470},{"r":2,"m":{"c":"染色微球","s":"300nm","f":"红色 羧基-cooh","k":"CS02U0103R","b":"20220419"},"set":{"k":["CS02U0103R","CS02N300R"]},"note":"旧货号 CS02U0103R（2026-10-04 更正：粒径码格式错，300 nm 为 N300）","id":471},{"r":2,"m":{"c":"染色微球","s":"2um","f":"红色 羧基-cooh","k":"CS02U0202R","b":"20231222"},"set":{"k":["CS02U0202R","CS02U002R"]},"note":"旧货号 CS02U0202R（2026-10-04 更正：粒径码格式错，2 µm 为 U002）","id":472},{"r":2,"m":{"c":"染色微球","s":"5um","f":"黑色","k":"CS01U005BL","b":"20251110"},"set":{"k":["CS01U005BL","CA01U005BL"]},"note":"旧货号 CS01U005BL（2026-10-04 更正：型号写的是 PMMA（UCPMMA0205BL））","id":474},{"r":2,"m":{"c":"染色微球","s":"1000um","f":"","k":"CS01U100B","b":"20230926"},"set":{"k":["CS01U100B","CS01U01KB"]},"note":"旧货号 CS01U100B（2026-10-04 更正：粒径 1000 µm 写成了 100 µm（型号 UCPS1000B））","id":476},{"r":2,"m":{"c":"染色微球","s":"100nm","f":"","k":"CS01N100DB","b":"20260511"},"set":{"k":["CS01N100DB","CA01N100DB"]},"note":"旧货号 CS01N100DB（2026-10-04 更正：型号写 PMMA，同批另一条写 pmma-深蓝色）","id":477},{"r":2,"m":{"c":"功能化PS微球","s":"30um","f":"PMMA 氨基-NH2","k":"PA01U030CM","b":"20240805"},"set":{"k":["PA01U030CM","PA03U030NA"]},"note":"旧货号 PA01U030CM（2026-10-04 更正：官能团写氨基（型号末尾 CM 不对）；可能和 PMMA微球 30 µm 氨基（批号 20240825）是同一批货，请核对）","id":480},{"r":2,"m":{"c":"PS荧光微球(橙红)","s":"50nm","f":"氨基","k":"FS01N050O","b":"20260601"},"set":{"k":["FS01N050O","FS03N050O"]},"note":"旧货号 FS01N050O（2026-10-04 更正：氨基是 03）","id":482},{"r":2,"m":{"c":"PS荧光微球(橙红)","s":"8um","f":"无","k":"FS01U008O2","b":"20240409"},"set":{},"note":"待确认：末尾 O2 不在编码规则里（备注 540 激发），确认是否另一种橙红染料","id":483},{"r":2,"m":{"c":"PMMA微球","s":"30um","f":"氨基-NH2","k":"PA01U030NAAM","b":"20240825"},"set":{"k":["PA01U030NAAM","PA03U030NA"]},"note":"旧货号 PA01U030NAAM（2026-10-04 更正：氨基写在 03 位，去掉末尾 AM）","id":485}],"add":[{"c":"PET微球","s":"300nm","f":"","m":"PETN300","k":"PETN300","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PET微球","s":"2um","f":"","m":"PETU002","k":"PETU002","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PP微球","s":"300nm","f":"","m":"PPN300","k":"PPN300","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PP微球","s":"1um","f":"","m":"PPU001","k":"PPU001","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PP微球","s":"2um","f":"","m":"PPU002","k":"PPU002","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PP微球","s":"5um","f":"","m":"PPU005","k":"PPU005","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PP微球","s":"10um","f":"","m":"PPU010","k":"PPU010","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"LDPE微球","s":"300nm","f":"","m":"LDPEN300","k":"LDPEN300","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"LDPE微球","s":"500nm","f":"","m":"LDPEN500","k":"LDPEN500","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"LDPE微球","s":"1um","f":"","m":"LDPEU001","k":"LDPEU001","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"LDPE微球","s":"2um","f":"","m":"LDPEU002","k":"LDPEU002","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"LDPE微球","s":"5um","f":"","m":"LDPEU005","k":"LDPEU005","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"LDPE微球","s":"10um","f":"","m":"LDPEU010","k":"LDPEU010","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PVC微球","s":"300nm","f":"","m":"PVCN300","k":"PVCN300","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PVC微球","s":"500nm","f":"","m":"PVCN500","k":"PVCN500","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PVC微球","s":"1um","f":"","m":"PVCU001","k":"PVCU001","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PVC微球","s":"2um","f":"","m":"PVCU002","k":"PVCU002","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PVC微球","s":"5um","f":"","m":"PVCU005","k":"PVCU005","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PVC微球","s":"10um","f":"","m":"PVCU010","k":"PVCU010","b":"","q":"0","n":0,"t":"待处理","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PA6微球","s":"300nm","f":"","m":"PA6N300","k":"PA6N300","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PA6微球","s":"500nm","f":"","m":"PA6N500","k":"PA6N500","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PA6微球","s":"1um","f":"","m":"PA6U001","k":"PA6U001","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PA6微球","s":"2um","f":"","m":"PA6U002","k":"PA6U002","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PA6微球","s":"5um","f":"","m":"PA6U005","k":"PA6U005","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PA6微球","s":"10um","f":"","m":"PA6U010","k":"PA6U010","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PLA微球","s":"300nm","f":"","m":"PLAN300","k":"PLAN300","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PLA微球","s":"500nm","f":"","m":"PLAN500","k":"PLAN500","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PLA微球","s":"1um","f":"","m":"PLAU001","k":"PLAU001","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PLA微球","s":"2um","f":"","m":"PLAU002","k":"PLAU002","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PLA微球","s":"5um","f":"","m":"PLAU005","k":"PLAU005","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]},{"c":"PLA微球","s":"10um","f":"","m":"PLAU010","k":"PLAU010","b":"","q":"0","n":0,"t":"待开发","o":"宽分布，按平均粒径标称（<1 µm DLS Z-均；≥1 µm 图像法数均径）","ln":"1","eb":"","pr":"","spec":"10mL 10mg/mL","qc":{},"logs":[],"att":[]}]};
+const FIX_DUP_NOTE="疑似重复：同货号同批号还有别的条目，核对后删多余的";
+function fixNorm(x){return x==null?"":String(x);}
+function fixMatch(i,m){return fixNorm(i.c)===m.c&&fixNorm(i.s)===m.s&&fixNorm(i.f)===m.f&&fixNorm(i.k).trim()===m.k&&fixNorm(i.b)===m.b;}
+function fixAddNote(it,text){const o=fixNorm(it.o).trim();if(o.indexOf(text)>=0)return false;it.o=(o?o+"；":"")+text;return true;}
+function applyFix20261004(arr,subs){
+  const st={recode:0,fill:0,cat:0,note:0,add:0,subs:0,dup:0,dupGroups:0,missing:0,ambiguous:0};
+  const kindOf=new Map(),rank={recode:4,fill:3,cat:2,note:1};
+  const mark=(it,k)=>{const p=kindOf.get(it);if(!p||rank[k]>rank[p])kindOf.set(it,k);};
+  FIX_20261004.rules.forEach(r=>{
+    const hits=arr.filter(i=>fixMatch(i,r.m));
+    if(hits.length>1){st.ambiguous++;return;}
+    if(!hits.length){
+      const v=(f,d)=>r.set[f]?fixNorm(r.set[f][1]):d;
+      const post={c:v("c",r.m.c),s:v("s",r.m.s),f:r.m.f,k:v("k",r.m.k).trim(),b:v("b",r.m.b)};
+      if(!arr.some(i=>fixMatch(i,post)))st.missing++; // 找不到改后的样子 → 这条在别处被改过或删了
+      return;
+    }
+    const it=hits[0];
+    Object.keys(r.set).forEach(f=>{
+      const o=r.set[f][0],n=r.set[f][1];
+      if(fixNorm(it[f])===fixNorm(o)&&fixNorm(it[f])!==fixNorm(n)){
+        it[f]=n;
+        mark(it,f==="k"?(fixNorm(o).trim()?"recode":"fill"):f==="c"?"cat":"note");
+      }
+    });
+    if(r.note&&fixAddNote(it,r.note))mark(it,"note");
+  });
+  kindOf.forEach(k=>{st[k]++;});
+  // 补常备档：库存里还没有这个货号才加；uid 按内容算，几台设备各点一次也不会重复
+  const codes=new Set(arr.map(i=>fixNorm(i.k).trim()));
+  let nid=arr.length?Math.max(...arr.map(i=>i.id||0))+1:0;
+  FIX_20261004.add.forEach(a=>{
+    const k=fixNorm(a.k).trim();if(codes.has(k))return;
+    const ni=JSON.parse(JSON.stringify(a));ni.id=nid++;ni.uid=legacyUid(ni);
+    arr.push(ni);codes.add(k);st.add++;
+  });
+  // 分类：补 LDPE/PA6/PLA 微球，去掉已并入的「染色PS微球」
+  const pol=(subs||[]).find(x=>x.id==="polyref");
+  if(pol){
+    let anchor=pol.sub.indexOf("LDPE微球")>=0?"LDPE微球":"PVC微球";
+    ["LDPE微球","PA6微球","PLA微球"].forEach(cat=>{
+      if(pol.sub.indexOf(cat)<0){const ix=pol.sub.indexOf(anchor);pol.sub.splice(ix>=0?ix+1:pol.sub.length,0,cat);st.subs++;}
+      anchor=cat;
+    });
+  }
+  (subs||[]).forEach(x=>{const j=x.sub.indexOf("染色PS微球");if(j>=0){x.sub.splice(j,1);st.subs++;}});
+  // 疑似重复：同货号同批号多条，只写备注，不删不改数量
+  const g={};
+  arr.forEach(i=>{const k=fixNorm(i.k).trim(),b=fixNorm(i.b).trim();if(k&&b)(g[k+"\u0001"+b]=g[k+"\u0001"+b]||[]).push(i);});
+  Object.keys(g).forEach(key=>{const rows=g[key];if(rows.length<2)return;st.dupGroups++;
+    rows.forEach(r=>{if(fixNorm(r.o).indexOf("疑似重复")<0){fixAddNote(r,FIX_DUP_NOTE);st.dup++;}});});
+  return st;
+}
+function fix20261004Preview(){
+  const st=applyFix20261004(JSON.parse(JSON.stringify(items||[])),JSON.parse(JSON.stringify(getSeriesSubs())));
+  st.pending=st.recode+st.fill+st.cat+st.note+st.add+st.subs;
+  return st;
+}
+function openFix20261004(){
+  const st=fix20261004Preview();
+  const ov=document.createElement("div");ov.className="overlay";ov.id="fixOv";
+  const row=(t,n)=>n?`<div style="color:#e5e7eb">${t} <b style="color:#60a5fa">${n}</b></div>`:"";
+  ov.innerHTML=`<div class="modal" style="padding:24px">
+    <div style="text-align:center;font-size:32px;margin-bottom:6px">🔧</div>
+    <div style="text-align:center;font-size:16px;font-weight:700;color:#fff;margin-bottom:12px">货号更正（2026-10-04）</div>
+    <div style="background:#111318;border-radius:8px;padding:10px;margin-bottom:12px;font-size:12px;line-height:1.9">
+      ${row("更正写错的货号",st.recode)}${row("给没有货号的条目补码",st.fill)}${row("染色PS微球并入染色微球",st.cat)}
+      ${row("只加备注 / 补规格",st.note)}${row("补常备档新条目",st.add)}${row("分类列表调整",st.subs)}
+      ${row("标注疑似重复（只写备注）",st.dup)}
+      ${st.missing?`<div style="color:#fbbf24">${st.missing} 条规则没找到对应条目（可能已手动改过），跳过</div>`:""}
+      ${st.ambiguous?`<div style="color:#fbbf24">${st.ambiguous} 条规则匹配到多条，跳过</div>`:""}
+    </div>
+    <div style="font-size:11px;color:#6b7280;margin-bottom:14px;line-height:1.7">库存数量、出入库记录、出库单、客户<b style="color:#34d399">都不动</b>。旧货号写进备注。改之前本机自动留一份备份，云端也会自动存一个版本，可在「版本历史」回滚。</div>
+    <button class="btn" style="background:#059669;margin-bottom:8px" onclick="doFix20261004()">确认更正</button>
+    <button class="btn" style="background:#374151" onclick="document.getElementById('fixOv').remove()">取消</button>
+  </div>`;
+  document.body.appendChild(ov);
+}
+function doFix20261004(){
+  const el=document.getElementById("fixOv");if(el)el.remove();
+  try{localStorage.setItem("RIGOR_INV_before_fix_20261004",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),shipNotes,customers,savedAt:_savedAt}));}catch(e){console.error("更正前备份失败:",e);}
+  let st;
+  try{st=applyFix20261004(items,getSeriesSubs());}catch(e){alert("更正失败："+e.message);return;}
+  nextId=items.length?Math.max(...items.map(i=>i.id||0))+1:0;
+  saveState();render();
+  setTimeout(()=>alert("货号更正完成\n\n更正货号 "+st.recode+" 条 · 补码 "+st.fill+" 条\n染色分类合并 "+st.cat+" 条 · 新增常备档 "+st.add+" 条\n标注疑似重复 "+st.dup+" 条\n\n在搜索框输入「疑似重复」或「待确认」可以找到要人工核对的条目"),200);
 }
 
 function exportData(){
@@ -569,6 +714,7 @@ function importData(){
 function mergeImport(bak){
   const st={newItems:0,newLogs:0,newSN:0,newCust:0,newPipe:0,skipped:0,dupInBak:0};
   // ── 产品 ──
+  ensureItemUids(items);ensureItemUids(bak.items);
   const cur={};
   items.forEach(i=>{cur[itemKey(i)]=i;});
   const addedNow=new Set(); // 本次导入新增的 key，用于识别备份内部重复
@@ -581,8 +727,10 @@ function mergeImport(bak){
       // 备份独有的产品 → 整条补进来
       const ni=Object.assign({},bi);
       ni.id=nextId++;
+      if(cur[k])ni.uid=newItemUid(); // 和现有条目撞号的，换新号，免得下次同步又被并掉
       ni.qc=ni.qc||{};ni.att=ni.att||[];ni.logs=ni.logs||[];
-      items.push(ni);cur[k]=ni;addedNow.add(k);st.newItems++;
+      const nk=itemKey(ni);
+      items.push(ni);cur[nk]=ni;addedNow.add(nk);st.newItems++;
       st.newLogs+=ni.logs.length;
     }else{
       // 已存在 → 库存和字段一概不动，只补历史出入库记录
@@ -663,7 +811,7 @@ function confirmMergeImport(){
 function confirmImport(){
   document.getElementById("importOv").remove();
   const d=window._importData;if(!d)return;
-  items=d.items;allLogs=d.logs||[];pipe=d.pipe||pipe;
+  items=ensureItemUids(d.items);allLogs=d.logs||[];pipe=d.pipe||pipe;
   applySeriesSubs(d.seriesSubs);
   // 关键：出库单和客户档案也要恢复
   if(Array.isArray(d.shipNotes))shipNotes=d.shipNotes;
@@ -707,6 +855,7 @@ if(!loadFromStorage()){
   items=RAW.map((d,i)=>({id:i,c:d.c,s:d.s,f:d.f,m:d.m,k:d.k,b:d.b,q:d.q,n:d.n,t:d.t,o:d.o,ln:d.ln||"1",eb:d.eb||"",pr:d.pr||"",spec:d.spec||"",qc:{},logs:[],att:[]}));
   // Auto-generate external batch for items without one
   items.forEach(d=>{if(!d.eb&&d.b)d.eb=genExtBatch(d.c,d.b,d.ln);});
+  ensureItemUids(items);rebaseItemSigs();
   allLogs=[];
   pipe=[
     {id:1,nm:"PET纳米微球多规格攻关",pr:"P0",ph:"Week 1-2",st:"进行中",tg:"300-500nm+500-1μm",nt:"50/100nm已就绪"},
@@ -1211,7 +1360,7 @@ function doAdd(){
   if(!data){alert("请填写产品分类和粒径/规格");return;}
   // Auto-gen external batch if empty
   if(!data.eb&&data.b)data.eb=genExtBatch(data.c,data.b,data.ln);
-  const newItem={id:nextId++,...data,q:String(data.n),qc:{},logs:[],att:[]};
+  const newItem={id:nextId++,uid:newItemUid(),...data,q:String(data.n),qc:{},logs:[],att:[]};
   items.push(newItem);
   const sr=fs(data.c);
   if(!sr.sub.includes(data.c)){SERIES[0].sub.push(data.c);}
@@ -2112,7 +2261,19 @@ function rSync(){
   h+=`<div><div style="font-size:18px;font-weight:700;color:#fff">${pipe.length}</div><div style="color:#6b7280">研发项目</div></div>`;
   h+=`<div><div style="font-size:18px;font-weight:700;color:#fff">${allLogs.length}</div><div style="color:#6b7280">操作记录</div></div>`;
   h+=`</div>`;
-  h+=`<div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e2130;font-size:10px;color:#6b7280">上次同步: ${lastSync||"尚未保存"} · ${dataSize} KB</div></div>`;
+  h+=`<div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e2130;font-size:10px;color:#6b7280">上次同步: ${lastSync||"尚未保存"} · ${dataSize} KB<br>程序版本: ${APP_VER}</div></div>`;
+
+  // 货号更正（2026-10-04）
+  try{
+    const fx=fix20261004Preview();
+    if(fx.pending>0){
+      h+=`<div class="card" style="cursor:default;border-color:#d97706"><div style="font-size:13px;font-weight:600;color:#fbbf24;margin-bottom:8px">🔧 货号更正（2026-10-04）</div>`;
+      h+=`<div style="font-size:11px;color:#9ca3af;line-height:1.7;margin-bottom:10px">按统一编码规则更正写错的货号、给没有货号的批次补码、合并两个染色分类、补 PA6/PLA 等常备档。库存数量和出入库记录不变。</div>`;
+      h+=`<button class="btn" style="background:#d97706" onclick="openFix20261004()">预览并更正（${fx.pending} 处）</button></div>`;
+    }else{
+      h+=`<div class="card" style="cursor:default"><div style="font-size:12px;color:#34d399">✅ 货号更正（2026-10-04）已完成</div></div>`;
+    }
+  }catch(e){console.error("货号更正预览失败:",e);}
 
   if(!hasSB){
     h+=`<div class="card" style="cursor:default;border-color:#6366f1"><div style="font-size:13px;font-weight:600;color:#34d399;margin-bottom:10px">⚡ 配置 Supabase（一次性，5分钟）</div>`;
