@@ -275,6 +275,24 @@ function ensureItemUids(arr){
   });
   return arr;
 }
+// ═══ 每条的最后修改时间 mt ═══
+// 同步合并时，两边都有这条：文本字段（货号/型号/批号/备注…）取 mt 较新的一边；都没有 mt 时仍以本机为准（老规则）。
+// 不在每个编辑入口单独记时间，而是在 saveState 时对比每条的内容签名，变了就记 mt，任何改动路径都不会漏。
+const SIG_SKIP={id:1,n:1,q:1,t:1,logs:1,att:1,mt:1}; // 库存数/记录/附件另有合并规则
+function itemSig(i){const o={};Object.keys(i).sort().forEach(k=>{if(!SIG_SKIP[k])o[k]=i[k];});return JSON.stringify(o);}
+let _itemSigs={};
+function rebaseItemSigs(){_itemSigs={};(items||[]).forEach(i=>{if(i&&i.uid)_itemSigs[i.uid]=itemSig(i);});}
+function stampItemEdits(){
+  const now=Date.now(),next={};
+  (items||[]).forEach(i=>{
+    if(!i||typeof i!=="object")return;
+    if(!i.uid)i.uid=newItemUid();
+    const s=itemSig(i),p=_itemSigs[i.uid];
+    if(p===undefined){if(!i.mt)i.mt=now;}else if(p!==s)i.mt=now;
+    next[i.uid]=s;
+  });
+  _itemSigs=next;
+}
 
 function mergeWithCloud(cloud){
   // ── 产品 & 出入库记录 ──
@@ -298,7 +316,8 @@ function mergeWithCloud(cloud){
     onlyLocal.forEach(lg=>{n+=(lg.tp==="in"?(lg.qt||0):-(lg.qt||0));});
     n=roundQty(Math.max(0,n));
     if(onlyLocal.length)recovered+=onlyLocal.length;
-    const base=Object.assign({},c,l); // 文本字段以本地（当前设备刚编辑的）为准
+    // 文本字段取最后修改的一边；两边都没有修改时间（老数据）时以本地为准
+    const base=(l.mt||0)>=(c.mt||0)?Object.assign({},c,l):Object.assign({},l,c);
     base.n=n;
     base.logs=cLogs.concat(onlyLocal);
     base.q=String(n);
@@ -361,6 +380,7 @@ async function reconcileOnConnect(){
     // 合并
     const m=mergeWithCloud(cloud);
     items=m.items;shipNotes=m.shipNotes;customers=m.customers;pipe=m.pipe;allLogs=m.logs;
+    rebaseItemSigs();
     if(m.seriesSubs)applySeriesSubs(m.seriesSubs);
     nextId=items.length;
     snNextId=shipNotes.length?Math.max(...shipNotes.map(n=>n.id||0))+1:1;
@@ -392,7 +412,7 @@ function getLocalSavedAt(){
 }
 
 function applyCloudData(d){
-  items=ensureItemUids(d.items);allLogs=d.logs||[];pipe=d.pipe||pipe;
+  items=ensureItemUids(d.items);rebaseItemSigs();allLogs=d.logs||[];pipe=d.pipe||pipe;
   shipNotes=d.shipNotes||shipNotes||[];
   customers=d.customers||customers||[];
   applySeriesSubs(d.seriesSubs);
@@ -483,6 +503,7 @@ function saveState(){
   const seriesSubs=getSeriesSubs();
   _localVer++; // 每次改动版本号+1，标记为脏
   _savedAt=Date.now();
+  try{stampItemEdits();}catch(e){console.error("记录修改时间失败:",e);}
   try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs,lastSync,shipNotes,customers,savedAt:_savedAt}));}catch(e){}
   _lastFingerprint=fingerprint(); // 更新兜底快照基线
   if(sbConnected)pushToCloud();
@@ -516,6 +537,7 @@ window.addEventListener("beforeunload",()=>{
   try{
     const fp=fingerprint();
     if(fp!==_lastFingerprint){
+      try{stampItemEdits();}catch(e){}
       localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers,savedAt:Date.now()}));
     }
   }catch(e){}
@@ -530,7 +552,7 @@ function loadFromStorage(){
   }catch(e){console.error("读取本地数据失败:",e);return false;}
   if(!d||!d.items||!Array.isArray(d.items))return false;
   // 核心数据先加载
-  items=ensureItemUids(d.items);allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";_savedAt=d.savedAt||0;
+  items=ensureItemUids(d.items);rebaseItemSigs();allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";_savedAt=d.savedAt||0;
   // 可选字段单独容错，任何一个出错都不影响主数据
   try{applySeriesSubs(d.seriesSubs);}catch(e){console.error("分类恢复失败:",e);}
   try{
@@ -740,7 +762,7 @@ if(!loadFromStorage()){
   items=RAW.map((d,i)=>({id:i,c:d.c,s:d.s,f:d.f,m:d.m,k:d.k,b:d.b,q:d.q,n:d.n,t:d.t,o:d.o,ln:d.ln||"1",eb:d.eb||"",pr:d.pr||"",spec:d.spec||"",qc:{},logs:[],att:[]}));
   // Auto-generate external batch for items without one
   items.forEach(d=>{if(!d.eb&&d.b)d.eb=genExtBatch(d.c,d.b,d.ln);});
-  ensureItemUids(items);
+  ensureItemUids(items);rebaseItemSigs();
   allLogs=[];
   pipe=[
     {id:1,nm:"PET纳米微球多规格攻关",pr:"P0",ph:"Week 1-2",st:"进行中",tg:"300-500nm+500-1μm",nt:"50/100nm已就绪"},
