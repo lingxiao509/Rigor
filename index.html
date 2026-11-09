@@ -76,8 +76,21 @@ input,select,textarea,button{font-family:inherit;outline:none}
 }
 
 /* ── Mobile: compact ── */
+#syncPill{position:fixed;top:10px;right:12px;z-index:45;padding:5px 11px;border-radius:999px;font-size:11px;cursor:pointer;background:#1a1d27ee;border:1px solid #2a2e3e;color:#9ca3af;display:flex;align-items:center;gap:6px;backdrop-filter:blur(8px);max-width:70vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 10px #0006}
+#syncPill.ok{color:#34d399;border-color:#065f46}
+#syncPill.warn{color:#fbbf24;border-color:#92400e}
+#syncPill.err{color:#f87171;border-color:#7f1d1d}
+#syncPill.off{color:#6b7280}
+#syncPill .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#34d399;box-shadow:0 0 6px #34d399}
+#clockWarn,#legacyWarn{position:fixed;left:50%;transform:translateX(-50%);z-index:46;max-width:94vw;padding:8px 14px;border-radius:10px;font-size:12px;line-height:1.5;box-shadow:0 4px 16px #000a}
+#clockWarn{top:44px;background:#7f1d1d;border:1px solid #f87171;color:#fecaca}
+#legacyWarn{top:44px;background:#78350f;border:1px solid #fbbf24;color:#fef3c7}
+#clockWarn+#legacyWarn{top:110px}
 @media(max-width:767px){
-  .app-wrap{max-width:540px;margin:0 auto}
+  .app-wrap{max-width:540px;margin:0 auto;padding-top:30px}
+  #syncPill{top:6px;right:8px;font-size:10px;padding:4px 9px;max-width:62vw}
+  #clockWarn,#legacyWarn{top:36px;font-size:11px;padding:6px 10px}
+  #clockWarn+#legacyWarn{top:100px}
   .overlay{align-items:flex-end}
   .modal{border-radius:16px 16px 0 0;width:100%;max-width:540px}
 }
@@ -193,60 +206,69 @@ function genExtBatch(cat,batch,line){
   return s+mCode+yCode+day+ln+clr;
 }
 
-// ═══ SUPABASE + LOCAL STORAGE (国内可用，免费) ═══
-let items, allLogs, pipe, lastSync="";
-// 出库单 & 客户档案（必须在 loadFromStorage 之前声明，否则 TDZ 会导致读取失败）
+// ═══ SUPABASE 云同步 v3（按记录同步，永不整库覆盖）═══
+// 旧版把整个数据库打包成一个 JSON 上传，谁最后上传谁覆盖，另一方的登记就没了。
+// v3 架构：
+//   · 云端每条记录各占一行：item:<产品> log:<出入库> sn:<出库单> cust:<客户> pipe:<研发> meta dev:<设备> snap_<快照>
+//   · 本机只上传「有改动的记录」，只下载「别人改过的记录」，互不覆盖
+//   · 库存数 n 不直接同步，而是 = base(基数) + Σ出入库记录。两台电脑各自登记的记录合并后结果一致
+//   · 未上传的改动会记在本机，刷新/断网/关机都不会丢，联网后自动补传（指数退避重试）
+//   · 云端 updated_at 由数据库生成（服务器时间），本机时间错误不影响同步，并用于校正日期
+let items, allLogs=[], pipe, lastSync="";
 let shipNotes=[], snNextId=1, snDraft=null;
 let customers=[], custNextId=1;
-let sbClient=null, sbConnected=false, sbSaving=false, sbPollTimer=null, _lastSbUpdate="";
-const SB_KEY="RIGOR_SB_CONFIG";
+let sbClient=null, sbConnected=false, sbSaving=false, sbPollTimer=null, _hbTimer=null;
+const SB_KEY="RIGOR_SB_CONFIG", SYNC_KEY="RIGOR_SYNC", TRASH_KEY="RIGOR_TRASH";
+const FMT_VER=3; // 本地/云端数据格式版本
+const APP_VER="2026-11-09 · v3 按记录同步"; // 程序版本（同步页显示，用于确认各电脑都已刷新到新版）
+const TBL="rigor_inventory";
 
 function getSBConfig(){
   try{const s=localStorage.getItem(SB_KEY);return s?JSON.parse(s):null;}catch(e){return null;}
 }
 function saveSBConfig(cfg){localStorage.setItem(SB_KEY,JSON.stringify(cfg));}
 
-// ── 版本号防丢机制 ──
-// 每次本地改动 _localVer++。推送时记录推送的版本号，只有推送成功且期间没有新改动
-// (_localVer 未变) 才认为"干净"。任何一次成功推送都不会误清掉更新的改动。
-let _savedAt=0;         // 最后一次保存的时间戳，用于重连对账
-let _lastFingerprint="";// 兜底自动保存的基线快照
-let _localVer=0;        // 本地改动版本号，每次 saveState 递增
-let _syncedVer=0;       // 已成功同步到云端的版本号
-let _pushInFlight=false;// 正在上传
-let _pushQueued=false;  // 有排队等待的上传
+// ── 同步状态 ──
+let _hashes={};        // data_key → 上次与云端一致时的内容哈希（"DEL" = 已删除）。本机内容哈希≠此值 ⇒ 有未上传改动
+let _seen={};          // data_key → 已处理过的 updated_at（避免重复应用）
+let _lastPull="";      // 增量拉取游标（服务器时间）
+let _mainTs="";        // 旧版 main 行最后处理过的时间戳
+let _migMainTs="";     // 迁移时的 main 行时间戳（之前的 main 内容已经迁移过，忽略）
+let _devId="", _devName="";
+let _devices={};       // 其他设备心跳 devId → {name,ver,pend,_ts}
+let _clockOff=0;       // 服务器时间 − 本机时间（毫秒）
+let _clockChecked=false;
+let _pushInFlight=false,_pushQueued=false,_pullInFlight=false;
+let _pushTimer=null,_retryN=0,_lastErr="",_lastPushAt=0,_lastPullAt=0,_lastFullPullAt=0,_lastMainCheck=0;
+let _pendingCount=0;
+let _orphans={};       // iid → [出入库记录]（产品行还没到）
+let _renderDeferred=false;
+let _firstSync=false;  // 本机首次接入 v3 云端（没有哈希表）
+let _lastSnapAt=0;
+let _legacySeen=false; // 检测到旧版本客户端仍在写入
+let _savedAt=0,_lastFingerprint="";
+function isDirty(){return _pendingCount>0;}
 
-function isDirty(){return _localVer!==_syncedVer;}
-
-async function initSupabase(cfg){
-  try{
-    sbClient=supabase.createClient(cfg.url,cfg.anonKey);
-    const{data,error}=await sbClient.from("rigor_inventory").select("id,updated_at").eq("data_key","main").limit(1);
-    if(error&&error.code==="42P01"){
-      alert("请先在 Supabase 控制台创建表，详见同步页面的说明。");
-      sbConnected=false;return false;
-    }
-    sbConnected=true;
-    await reconcileOnConnect();
-    if(sbPollTimer)clearInterval(sbPollTimer);
-    sbPollTimer=setInterval(pollCloud,5000);
-    return true;
-  }catch(e){console.error("Supabase init error:",e);sbConnected=false;return false;}
+// ── 小工具 ──
+function h32(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return(h>>>0).toString(36);}
+function hashOf(s){return h32(s)+"."+h32(s.length+"|"+s);}
+function stableJSON(o){
+  if(o===null||typeof o!=="object")return JSON.stringify(o===undefined?null:o);
+  if(Array.isArray(o))return"["+o.map(stableJSON).join(",")+"]";
+  const ks=Object.keys(o).filter(k=>o[k]!==undefined&&typeof o[k]!=="function").sort();
+  return"{"+ks.map(k=>JSON.stringify(k)+":"+stableJSON(o[k])).join(",")+"}";
 }
+function serverNow(){return Date.now()+_clockOff;}
+function newUid(p){return(p||"")+serverNow().toString(36)+Math.random().toString(36).slice(2,8);}
+function fmtDate(ms){const d=new Date(ms);return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");}
+function todayStr(){return fmtDate(serverNow());}
+function nowStr(){return new Date(serverNow()).toLocaleString("zh-CN");}
+function tsNum(iso){const t=Date.parse(iso||"");return isFinite(t)?t:0;}
+function parsePayload(p){try{return typeof p==="string"?JSON.parse(p):p;}catch(e){return null;}}
 
-// ═══ 合并式对账（不再是「一方覆盖另一方」）═══
-// 断网期间双方各自的出入库记录、出库单、客户都保留，库存按记录增量重算
-function logKey(lg,idx){
-  if(lg&&lg.uid)return lg.uid;
-  // 内容指纹：跨设备/跨备份去重都稳定，不受排列顺序影响
-  return [lg&&lg.tp,lg&&lg.qt,lg&&lg.dt,(lg&&lg.bt)||"",lg&&lg.pv,lg&&lg.nx].join("_");
-}
-const APP_VER="2026-10-04 · 按条目编号合并";
-// ═══ 产品条目的身份：每条一个固定编号 uid ═══
-// 以前按「货号+分类+粒径+官能团」判断是不是同一条，同一产品的不同批次就会在同步时被合并成一条。
-// 也不能改成「货号+批号」：入库时批号会更新，同一条的批号会变。
-// 所以给每条一个创建后就不再变的 uid，同步/合并导入都按 uid 认条目。
-// 老数据没有 uid：按原来的四要素算一个确定的 uid（各设备算出来一样），所以升级前后不会多出重复条目。
+// ═══ 产品条目的身份：每条一个固定编号 uid（沿用 2026-10-04 版的规则）═══
+// 同一产品的不同批次是不同条目；老数据没有 uid 时按「货号+分类+粒径+官能团」算出确定的 uid，各设备一致。
+// 云端每个产品一行：item:<uid>。iid 与 uid 始终相同（iid 是同步层用的名字）。
 function legacyItemKey(i){
   return [String(i.k||"").trim(),String(i.c||"").trim(),String(i.s||"").trim(),String(i.f||"").trim()].join("|");
 }
@@ -258,7 +280,7 @@ function cyrb53(str,seed){
   return 4294967296*(2097151&h2)+(h1>>>0);
 }
 function legacyUid(i){return "L"+cyrb53(legacyItemKey(i)).toString(36);}
-function newItemUid(){return "R"+Date.now().toString(36)+Math.random().toString(36).slice(2,8);}
+function newItemUid(){return "R"+serverNow().toString(36)+Math.random().toString(36).slice(2,8);}
 function itemKey(i){
   if(!i.uid)i.uid=legacyUid(i);
   return "u:"+i.uid;
@@ -270,278 +292,167 @@ function ensureItemUids(arr){
     if(!i||typeof i!=="object")return;
     if(!i.uid)i.uid=legacyUid(i);
     if(seen.has(i.uid))i.uid="L"+cyrb53(legacyItemKey(i)+"#"+(i.b||"")+"#"+(i.eb||"")).toString(36);
-    if(seen.has(i.uid))i.uid=newItemUid();
+    // 仍然撞号（完全相同的重复条目）：按出现顺序编号，不用随机号，保证各设备算出来一样
+    if(seen.has(i.uid)){const b0=i.uid;let n=2;while(seen.has(b0+"-"+n))n++;i.uid=b0+"-"+n;}
     seen.add(i.uid);
   });
   return arr;
 }
-// ═══ 每条的最后修改时间 mt ═══
-// 同步合并时，两边都有这条：文本字段（货号/型号/批号/备注…）取 mt 较新的一边；都没有 mt 时仍以本机为准（老规则）。
-// 不在每个编辑入口单独记时间，而是在 saveState 时对比每条的内容签名，变了就记 mt，任何改动路径都不会漏。
-const SIG_SKIP={id:1,n:1,q:1,t:1,logs:1,att:1,mt:1}; // 库存数/记录/附件另有合并规则
-function itemSig(i){const o={};Object.keys(i).sort().forEach(k=>{if(!SIG_SKIP[k])o[k]=i[k];});return JSON.stringify(o);}
-let _itemSigs={};
-function rebaseItemSigs(){_itemSigs={};(items||[]).forEach(i=>{if(i&&i.uid)_itemSigs[i.uid]=itemSig(i);});}
-function stampItemEdits(){
-  const now=Date.now(),next={};
-  (items||[]).forEach(i=>{
-    if(!i||typeof i!=="object")return;
-    if(!i.uid)i.uid=newItemUid();
-    const s=itemSig(i),p=_itemSigs[i.uid];
-    if(p===undefined){if(!i.mt)i.mt=now;}else if(p!==s)i.mt=now;
-    next[i.uid]=s;
-  });
-  _itemSigs=next;
+// 出入库记录内容指纹（老记录没有 uid 时使用）
+function logFp(lg){return[lg&&lg.tp,lg&&lg.qt,lg&&lg.dt,(lg&&lg.bt)||"",lg&&lg.pv,lg&&lg.nx].join("_");}
+function logKey(lg,idx){if(lg&&lg.uid)return lg.uid;return logFp(lg);}
+function logDelta(lg){const q=Number(lg&&lg.qt)||0;return lg&&lg.tp==="in"?q:-q;}
+function calcN(it){let n=Number(it.base);if(!isFinite(n))n=0;(it.logs||[]).forEach(lg=>{n+=logDelta(lg);});return roundQty(n);}
+const STOCK_STATUSES=["正常","低库存","缺货"];
+function logSortKey(lg){return String(lg.dt||"")+"|"+String(lg.ts||0).padStart(14,"0");}
+// 按记录重算库存；人工状态（研发中/待处理…）保留，库存类状态自动更新
+function recalcItem(it){
+  if(!Array.isArray(it.logs))it.logs=[];
+  it.logs.sort((a,b)=>logSortKey(a).localeCompare(logSortKey(b)));
+  const n=calcN(it);it.n=n;it.q=String(n);
+  if(!it.t||STOCK_STATUSES.indexOf(it.t)>=0)it.t=stockStatus(n);
 }
-
-function mergeWithCloud(cloud){
-  // ── 产品 & 出入库记录 ──
-  ensureItemUids(cloud.items);ensureItemUids(items);
-  const cMap={},lMap={};
-  (cloud.items||[]).forEach(i=>{cMap[itemKey(i)]=i;});
-  (items||[]).forEach(i=>{lMap[itemKey(i)]=i;});
-  const keys=[...new Set([...Object.keys(cMap),...Object.keys(lMap)])];
-  const merged=[];
-  let recovered=0;
-  keys.forEach(k=>{
-    const c=cMap[k],l=lMap[k];
-    if(c&&!l){merged.push(c);return;}
-    if(l&&!c){merged.push(l);recovered++;return;}
-    const cLogs=c.logs||[],lLogs=l.logs||[];
-    const cSet=new Set(cLogs.map((x,i)=>logKey(x,i)));
-    // 本地独有的出入库记录（断网期间登记的）
-    const onlyLocal=lLogs.filter((x,i)=>!cSet.has(logKey(x,i)));
-    // 库存 = 云端库存 + 本地独有记录的增减量
-    let n=typeof c.n==="number"?c.n:0;
-    onlyLocal.forEach(lg=>{n+=(lg.tp==="in"?(lg.qt||0):-(lg.qt||0));});
-    n=roundQty(Math.max(0,n));
-    if(onlyLocal.length)recovered+=onlyLocal.length;
-    // 文本字段取最后修改的一边；两边都没有修改时间（老数据）时以本地为准
-    const base=(l.mt||0)>=(c.mt||0)?Object.assign({},c,l):Object.assign({},l,c);
-    base.n=n;
-    base.logs=cLogs.concat(onlyLocal);
-    base.q=String(n);
-    base.t=stockStatus(n);
-    const cAtt=c.att||[],lAtt=l.att||[];
-    const aSet=new Set(cAtt.map(a=>a.aid));
-    base.att=cAtt.concat(lAtt.filter(a=>!aSet.has(a.aid)));
-    merged.push(base);
-  });
-  merged.forEach((it,i)=>{it.id=i;}); // 重排 id 避免冲突
-
-  // ── 出库单：按单号取并集 ──
-  const cSN=cloud.shipNotes||[],lSN=shipNotes||[];
-  const snSeen=new Set(cSN.map(s=>s.no||("id"+s.id)));
-  const onlySN=lSN.filter(s=>!snSeen.has(s.no||("id"+s.id)));
-  const mSN=cSN.concat(onlySN);
-  mSN.sort((a,b)=>String(b.no||"").localeCompare(String(a.no||"")));
-  mSN.forEach((s,i)=>{s.id=i+1;});
-  recovered+=onlySN.length;
-
-  // ── 客户：按姓名+电话取并集，单数取较大值 ──
-  const cCu=cloud.customers||[],lCu=customers||[];
-  const cuMap={};
-  cCu.forEach(c=>{cuMap[(c.name||"")+"|"+(c.phone||"")]=Object.assign({},c);});
-  lCu.forEach(c=>{
-    const k=(c.name||"")+"|"+(c.phone||"");
-    if(cuMap[k]){
-      const e=cuMap[k];
-      e.orders=Math.max(e.orders||0,c.orders||0);
-      if((c.lastDate||"")>(e.lastDate||""))e.lastDate=c.lastDate;
-      e.addr=e.addr||c.addr;e.phone=e.phone||c.phone;
-    }else cuMap[k]=Object.assign({},c);
-  });
-  const mCu=Object.values(cuMap);
-  mCu.forEach((c,i)=>{c.id=i+1;});
-
-  // ── 研发项目：按 id 取并集 ──
-  const cP=cloud.pipe||[],lP=pipe||[];
-  const pSeen=new Set(cP.map(p=>p.id));
-  const mP=cP.concat(lP.filter(p=>!pSeen.has(p.id)));
-
-  // ── 全局操作日志：按内容去重 ──
-  const cL=cloud.logs||[],lL=allLogs||[];
-  const lgSeen=new Set(cL.map(x=>JSON.stringify(x)));
-  const mL=cL.concat(lL.filter(x=>!lgSeen.has(JSON.stringify(x))));
-
-  return{items:merged,shipNotes:mSN,customers:mCu,pipe:mP,logs:mL,
-    seriesSubs:cloud.seriesSubs,recovered};
+// 客户的下单次数由出库单推算，避免两台电脑各自 +1 互相覆盖
+function recalcCustomerOrders(){
+  const cnt={};(shipNotes||[]).forEach(sn=>{const k=(sn.to_name||"").trim();if(k)cnt[k]=(cnt[k]||0)+1;});
+  (customers||[]).forEach(c=>{const v=cnt[(c.name||"").trim()];if(v!==undefined)c.orders=Math.max(v,0);});
 }
-
-// 重连对账：合并双方数据，任何一方的登记都不会丢
-async function reconcileOnConnect(){
-  if(!sbClient)return;
-  try{
-    const{data}=await sbClient.from("rigor_inventory").select("payload,updated_at").eq("data_key","main").limit(1).single();
-    const cloud=(data&&data.payload)?(typeof data.payload==="string"?JSON.parse(data.payload):data.payload):null;
-    if(!cloud||!cloud.items||!cloud.items.length){await pushToCloud();return;}
-    // 本地还没有数据 → 直接用云端
-    if(!items||!items.length){_lastSbUpdate=data.updated_at;applyCloudData(cloud);return;}
-    // 合并
-    const m=mergeWithCloud(cloud);
-    items=m.items;shipNotes=m.shipNotes;customers=m.customers;pipe=m.pipe;allLogs=m.logs;
-    rebaseItemSigs();
-    if(m.seriesSubs)applySeriesSubs(m.seriesSubs);
-    nextId=items.length;
-    snNextId=shipNotes.length?Math.max(...shipNotes.map(n=>n.id||0))+1:1;
-    custNextId=customers.length?Math.max(...customers.map(c=>c.id||0))+1:1;
-    nextPipeId=pipe.length?Math.max(...pipe.map(p=>p.id||0))+1:1;
-    selId=null;
-    _savedAt=Date.now();_localVer++;
-    await pushToCloud();
-    if(m.recovered>0){
-      setTimeout(()=>alert("已合并离线期间的登记记录\n找回 "+m.recovered+" 条本机独有的记录（出入库/出库单/产品）\n库存已按记录重新核算"),300);
+// 给所有记录补齐稳定 ID（老数据按内容推导，两台电脑推导结果一致），并补齐库存基数
+function ensureIdsOn(st){
+  (st.items||[]).forEach(it=>{if(it&&typeof it==="object"&&!it.uid&&it.iid)it.uid=it.iid;});
+  ensureItemUids(st.items);
+  (st.items||[]).forEach(it=>{
+    it.logs=Array.isArray(it.logs)?it.logs:[];it.att=Array.isArray(it.att)?it.att:[];it.qc=it.qc||{};
+    it.iid=it.uid;
+    const seenL={};
+    it.logs.forEach((lg,idx)=>{
+      if(!lg.uid){let u="L"+h32(it.iid+"|"+logFp(lg));while(seenL[u])u+="x";lg.uid=u;}
+      seenL[lg.uid]=1;
+    });
+    if(typeof it.base!=="number"||!isFinite(it.base)){
+      const n=Number(it.n)||0;let s=0;it.logs.forEach(lg=>{s+=logDelta(lg);});it.base=roundQty(n-s);
     }
-    render();
-  }catch(e){
-    console.error("对账失败:",e);
-    if(items&&items.length)await pushToCloud();
-  }
+  });
+  (st.shipNotes||[]).forEach(sn=>{if(!sn.sid)sn.sid="S"+h32(String(sn.no||"")+"|"+(sn.to_name||"")+"|"+(sn.ship_dt||""));});
+  (st.customers||[]).forEach(c=>{if(!c.cid)c.cid="C"+h32((c.name||"").trim()+"|"+(c.phone||"").trim());});
+  (st.pipe||[]).forEach(p=>{if(!p.pid)p.pid="P"+h32(String(p.nm||"")+"|"+String(p.id||""));});
 }
-// 数据丰富度：产品数 + 出入库记录总数 + 出库单 + 客户
-function richness(d){
-  if(!d)return -1;
-  const its=d.items||[];
-  const logCnt=its.reduce((s,i)=>s+((i.logs&&i.logs.length)||0),0);
-  return its.length+logCnt*2+((d.shipNotes||[]).length*3)+((d.customers||[]).length)+((d.logs||[]).length);
+function ensureIds(){ensureIdsOn({items,shipNotes,customers,pipe});}
+// 同一产品的记录匹配集合：uid / 内容指纹 / 由指纹推导的 uid，三者任一相同即视为同一条
+function logMatchSet(it){
+  const s=new Set();
+  (it.logs||[]).forEach(lg=>{if(lg.uid)s.add(lg.uid);const fp=logFp(lg);s.add("fp:"+fp);s.add("L"+h32((it.iid||"")+"|"+fp));});
+  return s;
 }
-function localSnapshot(){return{items,logs:allLogs,shipNotes,customers};}
-function getLocalSavedAt(){
-  try{const s=localStorage.getItem("RIGOR_INV");if(s)return JSON.parse(s).savedAt||0;}catch(e){}
-  return 0;
-}
-
-function applyCloudData(d){
-  items=ensureItemUids(d.items);rebaseItemSigs();allLogs=d.logs||[];pipe=d.pipe||pipe;
-  shipNotes=d.shipNotes||shipNotes||[];
-  customers=d.customers||customers||[];
-  applySeriesSubs(d.seriesSubs);
-  lastSync="☁ "+new Date().toLocaleString("zh-CN");
-  nextId=items.length?Math.max(...items.map(i=>i.id))+1:0;
-  nextPipeId=pipe.length?Math.max(...pipe.map(p=>p.id))+1:1;
-  snNextId=shipNotes.length?Math.max(...shipNotes.map(n=>n.id))+1:1;
-  custNextId=customers.length?Math.max(...customers.map(c=>c.id||0))+1:1;
-  // 云端数据被采纳，本地与云端一致
-  _syncedVer=_localVer;
-  _savedAt=d.savedAt||Date.now();
-  try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers,savedAt:_savedAt}));}catch(e){}
-  _lastFingerprint=fingerprint();
-  render();
-}
-
-// ── 填表保护 ──
-// 用户正在填表或有弹窗时，绝不让同步触发重新渲染，否则输入的内容会被清空
-const EDIT_VIEWS=["add","edit","inout","snform"];
-function isEditing(){
-  try{
-    if(EDIT_VIEWS.indexOf(V)>=0)return true;
-    if(document.querySelector(".overlay"))return true;
-    const ae=document.activeElement;
-    if(ae&&(ae.tagName==="INPUT"||ae.tagName==="TEXTAREA"||ae.tagName==="SELECT"))return true;
-  }catch(e){}
+function logMatches(set,it,lg){
+  if(lg.uid&&set.has(lg.uid))return true;
+  const fp=logFp(lg);
+  if(set.has("fp:"+fp))return true;
+  if(set.has("L"+h32((it.iid||"")+"|"+fp)))return true;
   return false;
 }
-let _pullDeferred=false;
 
-async function pullFromCloud(){
-  if(!sbClient)return;
-  // 本地有未同步改动或正在上传时，绝不覆盖本地
-  if(isDirty()||_pushInFlight)return;
-  // 正在填表 → 推迟到填完再拉
-  if(isEditing()){_pullDeferred=true;return;}
-  try{
-    const{data,error}=await sbClient.from("rigor_inventory").select("payload,updated_at").eq("data_key","main").limit(1).single();
-    if(error||!data)return;
-    // 网络往返期间用户可能已开始填表，再确认一次
-    if(isDirty()||_pushInFlight||isEditing()){_pullDeferred=true;return;}
-    _lastSbUpdate=data.updated_at;
-    const d=typeof data.payload==="string"?JSON.parse(data.payload):data.payload;
-    if(d&&d.items)applyCloudData(d);
-  }catch(e){console.error("Supabase pull error:",e);}
-}
-
-async function pollCloud(){
-  // 有任何本地未同步/上传中就跳过，避免把本地改动冲掉
-  if(sbSaving||_pushInFlight||isDirty()||!sbConnected||!sbClient)return;
-  if(isEditing()){_pullDeferred=true;return;} // 填表中，本轮跳过
-  try{
-    const{data}=await sbClient.from("rigor_inventory").select("updated_at").eq("data_key","main").limit(1).single();
-    if((data&&data.updated_at!==_lastSbUpdate)||_pullDeferred){_pullDeferred=false;await pullFromCloud();}
-  }catch(e){}
-}
-
-async function pushToCloud(){
-  if(!sbConnected||!sbClient)return;
-  // 已有上传在进行 → 标记排队，等当前上传结束后再补一次
-  if(_pushInFlight){_pushQueued=true;return;}
-  _pushInFlight=true;sbSaving=true;
-  const verAtPush=_localVer; // 记录本次上传对应的版本
-  try{await makeSnapshot();}catch(e){} // 覆盖前先留存上一版
-  try{
-    const payload={items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers,savedAt:_savedAt||Date.now()};
-    const{data,error}=await sbClient.from("rigor_inventory").upsert({data_key:"main",payload},{onConflict:"data_key"}).select("updated_at").single();
-    if(error){
-      console.error("Supabase push error:",error);
-      // 失败不清版本，isDirty 仍为 true，稍后会重试
-    }else{
-      if(data)_lastSbUpdate=data.updated_at;
-      lastSync="☁ "+new Date().toLocaleString("zh-CN");
-      _syncedVer=verAtPush; // 只认领本次上传的版本；若期间有新改动 _localVer 已更大，仍为脏
-    }
-  }catch(e){console.error("Supabase push error:",e);}
-  sbSaving=false;_pushInFlight=false;
-  // 上传期间又有新改动（排队或版本更新）→ 立即再推一次
-  if(_pushQueued||isDirty()){_pushQueued=false;await pushToCloud();}
-  else if(V==="dash")render(); // 刷新总览页的同步状态显示
-}
-
+// ── 云端行的序列化（n/q 是推算值，不上传；id 是本机编号，不上传）──
+// 库存类状态（正常/低库存/缺货）由库存数推算，不上传（上传空串），只有人工状态（研发中/待处理…）才同步
+function itemPayload(it){const o={};for(const k in it){if(k==="id"||k==="logs"||k==="n"||k==="q"||k[0]==="_")continue;o[k]=it[k];}o.t=STOCK_STATUSES.indexOf(it.t)>=0?"":(it.t||"");return o;}
+function logPayload(lg,iid){const o=Object.assign({},lg);delete o._;o.iid=iid;return o;}
+function snPayload(sn){const o=Object.assign({},sn);delete o.id;return o;}
+function custPayload(c){const o=Object.assign({},c);delete o.id;return o;}
+function pipePayload(p){const o=Object.assign({},p);delete o.id;return o;}
 function getSeriesSubs(){return SERIES.map(s=>({id:s.id,sub:s.sub}));}
-function applySeriesSubs(subs){if(!subs)return;subs.forEach(ss=>{const sr=SERIES.find(s=>s.id===ss.id);if(sr)sr.sub=ss.sub;});}
-
-function saveState(){
-  lastSync=new Date().toLocaleString("zh-CN");
-  const seriesSubs=getSeriesSubs();
-  _localVer++; // 每次改动版本号+1，标记为脏
-  _savedAt=Date.now();
-  try{stampItemEdits();}catch(e){console.error("记录修改时间失败:",e);}
-  try{localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs,lastSync,shipNotes,customers,savedAt:_savedAt}));}catch(e){}
-  _lastFingerprint=fingerprint(); // 更新兜底快照基线
-  if(sbConnected)pushToCloud();
+function applySeriesSubs(subs){if(!Array.isArray(subs))return;subs.forEach(ss=>{const sr=SERIES.find(s=>s.id===ss.id);if(sr&&Array.isArray(ss.sub))sr.sub=ss.sub;});}
+function metaPayload(){return{v:FMT_VER,seriesSubs:getSeriesSubs(),mainTs:_migMainTs||""};}
+function localRows(){
+  const rows={};
+  rows["meta"]=metaPayload();
+  (items||[]).forEach(it=>{rows["item:"+it.iid]=itemPayload(it);(it.logs||[]).forEach(lg=>{rows["log:"+lg.uid]=logPayload(lg,it.iid);});});
+  (shipNotes||[]).forEach(sn=>{rows["sn:"+sn.sid]=snPayload(sn);});
+  (customers||[]).forEach(c=>{rows["cust:"+c.cid]=custPayload(c);});
+  (pipe||[]).forEach(p=>{rows["pipe:"+p.pid]=pipePayload(p);});
+  return rows;
+}
+function localPayloadFor(key){
+  const i=key.indexOf(":");const type=i<0?key:key.slice(0,i),id=i<0?"":key.slice(i+1);
+  if(type==="meta")return metaPayload();
+  if(type==="item"){const it=items.find(x=>x.iid===id);return it?itemPayload(it):null;}
+  if(type==="log"){for(const it of items){const lg=(it.logs||[]).find(x=>x.uid===id);if(lg)return logPayload(lg,it.iid);}return null;}
+  if(type==="sn"){const sn=shipNotes.find(x=>x.sid===id);return sn?snPayload(sn):null;}
+  if(type==="cust"){const c=customers.find(x=>x.cid===id);return c?custPayload(c):null;}
+  if(type==="pipe"){const p=pipe.find(x=>x.pid===id);return p?pipePayload(p):null;}
+  return null;
+}
+// 本机这条记录是否有未上传的改动（有 ⇒ 本机优先，云端这条先不采用，等本机上传后云端会变成本机版本）
+function isPendingKey(key){
+  const h=_hashes[key];
+  const p=localPayloadFor(key);
+  if(!p)return false;
+  if(h===undefined)return!_firstSync; // 首次接入 v3：云端为准；平时：本机新建的记录为准
+  return hashOf(stableJSON(p))!==h;
+}
+// 本机已删除但墓碑还没上传
+function isPendingDelete(key){return _hashes[key]!==undefined&&_hashes[key]!=="DEL"&&!localPayloadFor(key);}
+// 计算所有待上传的行（含删除墓碑）
+function computePending(){
+  const rows=localRows();const out=[];
+  for(const k in rows){const h=hashOf(stableJSON(rows[k]));if(_hashes[k]!==h)out.push({key:k,payload:rows[k],hash:h});}
+  for(const k in _hashes){
+    if(rows[k]||_hashes[k]==="DEL")continue;
+    // 出入库记录是历史：随产品删除时保留在云端；只有「本机覆盖云端」会显式标记 X 删除
+    if(k.indexOf("log:")===0&&_hashes[k]!=="X")continue;
+    out.push({key:k,payload:{del:1,at:serverNow()},hash:"DEL"});
+  }
+  return out;
 }
 
-// ── 兜底自动保存 ──
-// 万一某个操作路径漏了 saveState，这里每 2 秒对比一次数据指纹，
-// 发现有变化就自动保存，确保任何改动都不会丢失。
+// ── 本地持久化 ──
+function saveLocalOnly(){
+  try{localStorage.setItem("RIGOR_INV",JSON.stringify({v:FMT_VER,items,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers,savedAt:serverNow()}));}
+  catch(e){console.error("本地保存失败:",e);}
+}
+let _syncMetaTimer=null;
+function saveSyncMeta(){
+  clearTimeout(_syncMetaTimer);
+  _syncMetaTimer=setTimeout(()=>{
+    try{localStorage.setItem(SYNC_KEY,JSON.stringify({v:FMT_VER,devId:_devId,devName:_devName,hashes:_hashes,lastPull:_lastPull,mainTs:_mainTs,migMainTs:_migMainTs,lastSnapAt:_lastSnapAt}));}catch(e){}
+  },200);
+}
+function loadSyncMeta(){
+  try{
+    const s=localStorage.getItem(SYNC_KEY);const m=s?JSON.parse(s):null;
+    if(m){_hashes=m.hashes||{};_lastPull=m.lastPull||"";_mainTs=m.mainTs||"";_migMainTs=m.migMainTs||"";_devId=m.devId||"";_devName=m.devName||"";_lastSnapAt=m.lastSnapAt||0;}
+  }catch(e){}
+  if(!_devId)_devId=newUid("D");
+  if(!_devName){
+    const ua=navigator.userAgent||"";
+    const os=/iPhone|iPad/.test(ua)?"iPhone":/Android/.test(ua)?"安卓":/Mac/.test(ua)?"Mac":/Windows/.test(ua)?"Windows":"设备";
+    _devName=os+"-"+_devId.slice(-4).toUpperCase();
+  }
+}
+function saveState(){
+  lastSync=nowStr();
+  try{ensureIds();}catch(e){console.error("补齐编号失败:",e);}
+  saveLocalOnly();
+  _lastFingerprint=fingerprint();
+  if(sbConnected)schedulePush();
+}
+
+// ── 兜底自动保存：每 2 秒对比数据指纹，有漏掉 saveState 的操作也会被保存 ──
 function fingerprint(){
   try{
     return items.length+"|"+
       items.reduce((s,i)=>s+(i.n||0),0)+"|"+
       items.reduce((s,i)=>s+((i.logs&&i.logs.length)||0),0)+"|"+
       items.reduce((s,i)=>s+((i.att&&i.att.length)||0),0)+"|"+
-      items.map(i=>i.k+i.b+i.t+(i.pr||"")).join("").length+"|"+
-      allLogs.length+"|"+shipNotes.length+"|"+customers.length+"|"+(pipe?pipe.length:0);
-  }catch(e){return "";}
+      items.map(i=>i.k+i.b+i.t+(i.pr||"")+(i.f||"")+(i.spec||"")).join("").length+"|"+
+      shipNotes.length+"|"+customers.length+"|"+(pipe?pipe.length:0)+"|"+(pipe||[]).map(p=>p.st).join("");
+  }catch(e){return"";}
 }
 setInterval(()=>{
-  if(_pushInFlight)return;
   const fp=fingerprint();
-  if(fp&&_lastFingerprint&&fp!==_lastFingerprint){
-    console.log("[兜底保存] 检测到未保存的改动，自动保存");
-    saveState();
-  }else if(fp&&!_lastFingerprint){
-    _lastFingerprint=fp;
-  }
+  if(fp&&_lastFingerprint&&fp!==_lastFingerprint){console.log("[兜底保存] 检测到未保存的改动");saveState();}
+  else if(fp&&!_lastFingerprint){_lastFingerprint=fp;}
 },2000);
-// 关闭页面前保底存一次本地
-window.addEventListener("beforeunload",()=>{
-  try{
-    const fp=fingerprint();
-    if(fp!==_lastFingerprint){
-      try{stampItemEdits();}catch(e){}
-      localStorage.setItem("RIGOR_INV",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),lastSync,shipNotes,customers,savedAt:Date.now()}));
-    }
-  }catch(e){}
-});
+window.addEventListener("beforeunload",()=>{try{saveLocalOnly();}catch(e){}});
 
 function loadFromStorage(){
   let d=null;
@@ -551,9 +462,7 @@ function loadFromStorage(){
     d=JSON.parse(s);
   }catch(e){console.error("读取本地数据失败:",e);return false;}
   if(!d||!d.items||!Array.isArray(d.items))return false;
-  // 核心数据先加载
-  items=ensureItemUids(d.items);rebaseItemSigs();allLogs=d.logs||[];pipe=d.pipe;lastSync=d.lastSync||"";_savedAt=d.savedAt||0;
-  // 可选字段单独容错，任何一个出错都不影响主数据
+  items=d.items;pipe=Array.isArray(d.pipe)?d.pipe:[];lastSync=d.lastSync||"";_savedAt=d.savedAt||0;
   try{applySeriesSubs(d.seriesSubs);}catch(e){console.error("分类恢复失败:",e);}
   try{
     shipNotes=Array.isArray(d.shipNotes)?d.shipNotes:[];
@@ -564,6 +473,527 @@ function loadFromStorage(){
     custNextId=customers.length?Math.max(...customers.map(c=>c.id||0))+1:1;
   }catch(e){console.error("客户档案恢复失败:",e);customers=[];custNextId=1;}
   return true;
+}
+
+// ── 填表保护：用户正在填表或有弹窗时，远端更新只进内存，不重绘界面 ──
+const EDIT_VIEWS=["add","edit","inout","snform"];
+function isEditing(){
+  try{
+    if(EDIT_VIEWS.indexOf(V)>=0)return true;
+    if(document.querySelector(".overlay"))return true;
+    const ae=document.activeElement;
+    if(ae&&(ae.tagName==="INPUT"||ae.tagName==="TEXTAREA"||ae.tagName==="SELECT"))return true;
+  }catch(e){}
+  return false;
+}
+
+// ── 回收站（本机）：被删除的记录留一份，误删可找回 ──
+function trashPut(type,obj){
+  try{const t=JSON.parse(localStorage.getItem(TRASH_KEY)||"[]");t.unshift({type,at:serverNow(),obj});localStorage.setItem(TRASH_KEY,JSON.stringify(t.slice(0,60)));}catch(e){}
+}
+function trashList(){try{return JSON.parse(localStorage.getItem(TRASH_KEY)||"[]");}catch(e){return[];}}
+function trashRestore(idx){
+  const t=trashList();const e=t[idx];if(!e)return;
+  const o=e.obj;
+  if(e.type==="item"){if(!items.some(x=>x.iid===o.iid)){o.id=nextId++;items.push(o);recalcItem(o);}}
+  else if(e.type==="sn"){if(!shipNotes.some(x=>x.sid===o.sid)){o.id=snNextId++;shipNotes.unshift(o);shipNotes.sort((a,b)=>String(b.no||"").localeCompare(String(a.no||"")));}}
+  else if(e.type==="cust"){if(!customers.some(x=>x.cid===o.cid)){o.id=custNextId++;customers.push(o);}}
+  else if(e.type==="pipe"){if(!pipe.some(x=>x.pid===o.pid)){o.id=nextPipeId++;pipe.push(o);}}
+  t.splice(idx,1);try{localStorage.setItem(TRASH_KEY,JSON.stringify(t));}catch(err){}
+  saveState();render();
+}
+
+// ═══ 连接 ═══
+let _connecting=false;
+// 打开页面时没网 / 中途掉线 → 每 15 秒自动重连，不需要人工干预
+async function ensureConnected(){
+  const cfg=getSBConfig();
+  if(!cfg||sbConnected||_connecting)return;
+  await initSupabase(cfg);
+}
+setInterval(ensureConnected,15000);
+async function initSupabase(cfg){
+  if(_connecting)return false;
+  _connecting=true;
+  try{
+    sbClient=supabase.createClient(cfg.url,cfg.anonKey,{auth:{persistSession:false,autoRefreshToken:false}});
+    const{error}=await sbClient.from(TBL).select("data_key").limit(1);
+    if(error){
+      if(error.code==="42P01")alert("请先在 Supabase 控制台创建表，详见同步页面的说明。");
+      else console.warn("Supabase 暂时连不上，15 秒后自动重试:",error.message||error);
+      sbConnected=false;sbClient=null;_lastErr=String(error.message||error);_connecting=false;updateStatus();return false;
+    }
+    sbConnected=true;_lastErr="";
+    await heartbeat();
+    await firstSync();
+    if(sbPollTimer)clearInterval(sbPollTimer);
+    sbPollTimer=setInterval(pollCloud,5000);
+    if(_hbTimer)clearInterval(_hbTimer);
+    _hbTimer=setInterval(heartbeat,30000);
+    _connecting=false;updateStatus();
+    return true;
+  }catch(e){console.error("Supabase init error:",e);sbConnected=false;_lastErr=String(e.message||e);_connecting=false;updateStatus();return false;}
+}
+// 心跳：告诉别人我在线，同时拿到服务器时间校正本机时钟
+async function heartbeat(){
+  if(!sbClient||!sbConnected)return;
+  try{
+    const{data,error}=await sbClient.from(TBL).upsert({data_key:"dev:"+_devId,payload:{name:_devName,ver:APP_VER,pend:_pendingCount,ua:(navigator.userAgent||"").slice(0,90)}},{onConflict:"data_key"}).select("updated_at").single();
+    if(!error&&data&&data.updated_at){noteServerTime(data.updated_at);_lastErr="";}
+    else if(error){_lastErr=String(error.message||error);}
+  }catch(e){_lastErr=String(e.message||e);}
+  updateStatus();
+}
+function noteServerTime(iso){
+  const t=tsNum(iso);if(!t)return;
+  _clockOff=t-Date.now();_clockChecked=true;
+  updateClockBanner();
+}
+function fixBannerPadding(){
+  try{const n=(document.getElementById("clockWarn")?1:0)+(document.getElementById("legacyWarn")?1:0);
+    const app=document.getElementById("app");if(app)app.style.paddingTop=n?(n*64)+"px":"";}catch(e){}
+}
+function updateClockBanner(){
+  let el=document.getElementById("clockWarn");
+  const bad=_clockChecked&&Math.abs(_clockOff)>6*3600e3;
+  if(!bad){if(el)el.remove();fixBannerPadding();return;}
+  if(!el){el=document.createElement("div");el.id="clockWarn";document.body.appendChild(el);}
+  const days=(Math.abs(_clockOff)/864e5).toFixed(1);
+  el.innerHTML=`⚠ 本机系统时间不正确（与服务器相差 ${days} 天，本机显示 ${new Date().toLocaleDateString("zh-CN")}）。请修正电脑日期时间。系统已自动按服务器时间记录日期和批号。`;
+  fixBannerPadding();
+}
+// 首次同步：判断云端格式 → 迁移 / 全量拉取 / 补传
+let _seedData=false; // 本机数据是内置示例（没有本地存档）→ 云端有数据时必须丢弃示例，不能把示例当成新产品传上去
+let _initialSyncing=false; // 首次同步（迁移/全量下载）进行中
+async function firstSync(){
+  if(!sbClient)return;
+  _initialSyncing=true;updateStatus();
+  try{await firstSyncInner();}finally{_initialSyncing=false;updateStatus();if(!isEditing())render();}
+}
+async function firstSyncInner(){
+  ensureIds();
+  const{data:meta}=await sbClient.from(TBL).select("payload,updated_at").eq("data_key","meta").maybeSingle();
+  const{data:mainRow}=await sbClient.from(TBL).select("payload,updated_at").eq("data_key","main").maybeSingle();
+  let legacy=mainRow&&mainRow.payload?parsePayload(mainRow.payload):null;
+  if(_seedData&&(meta||(legacy&&legacy.items&&legacy.items.length))){
+    items=[];shipNotes=[];customers=[];pipe=[];_hashes={};_seen={};_lastPull="";
+  }
+  _seedData=false;
+  try{_pendingCount=computePending().length;}catch(e){}
+  updateStatus();
+  if(!meta){
+    // 云端还是旧格式（或空）→ 由本机迁移：先把云端旧数据按「合并对账」并入本机，再按记录整体上传
+    if(legacy&&legacy.items&&legacy.items.length){legacyUnion(legacy);}
+    _migMainTs=mainRow?mainRow.updated_at||"":"";_mainTs=_migMainTs;
+    items.forEach(recalcItem);recalcCustomerOrders();
+    _hashes={};_seen={};_lastPull="";_firstSync=false;
+    saveLocalOnly();
+    await pushNow();
+    _lastFullPullAt=Date.now();
+    saveSyncMeta();render();
+    return;
+  }
+  const mp=parsePayload(meta.payload)||{};
+  if(mp.mainTs&&!_migMainTs)_migMainTs=mp.mainTs;
+  if(!_mainTs)_mainTs=_migMainTs;
+  _firstSync=Object.keys(_hashes).length===0;
+  await pullNow(true);
+  _firstSync=false;
+  _lastFullPullAt=Date.now();
+  await checkLegacyMain(true);
+  await pushNow();
+  saveSyncMeta();
+}
+// 迁移用：把旧格式云端数据与本机合并。共有产品以云端库存为准 + 本机独有记录的增减；
+// 本机独有的产品/出库单/客户/研发项目全部保留
+function legacyUnion(cloud){
+  const cst={items:cloud.items||[],shipNotes:cloud.shipNotes||[],customers:cloud.customers||[],pipe:cloud.pipe||[]};
+  ensureIdsOn(cst);
+  const lMap={};items.forEach(i=>{lMap[i.iid]=i;});
+  const merged=[];const used={};
+  cst.items.forEach(c=>{
+    const l=lMap[c.iid];
+    const base=roundQty((Number(c.n)||0)-(c.logs||[]).reduce((s,lg)=>s+logDelta(lg),0));
+    // 文本字段（货号/批号/备注…）取最后修改的一边（mt）；两边都没有修改时间时以本机为准（与 10-04 版规则一致）
+    const it=l?((l.mt||0)>=(c.mt||0)?Object.assign({},c,l):Object.assign({},l,c)):Object.assign({},c);
+    it.base=base;it.iid=c.iid;it.uid=c.uid;
+    if(l){
+      used[c.iid]=1;it.id=l.id;
+      const set=logMatchSet(c);
+      const onlyLocal=(l.logs||[]).filter(lg=>!logMatches(set,c,lg));
+      it.logs=(c.logs||[]).concat(onlyLocal);
+      const aSeen=new Set((c.att||[]).map(a=>a.aid));
+      it.att=(c.att||[]).concat((l.att||[]).filter(a=>!aSeen.has(a.aid)));
+    }else{it.id=nextId++;}
+    merged.push(it);
+  });
+  items.forEach(l=>{if(!used[l.iid]&&!cst.items.some(c=>c.iid===l.iid))merged.push(l);});
+  items=merged;
+  const snSeen=new Set(shipNotes.map(s=>s.sid));
+  cst.shipNotes.forEach(s=>{if(!snSeen.has(s.sid)){s.id=snNextId++;shipNotes.push(s);}});
+  shipNotes.sort((a,b)=>String(b.no||"").localeCompare(String(a.no||"")));
+  const cuMap={};customers.forEach(c=>{cuMap[c.cid]=c;});
+  cst.customers.forEach(c=>{if(!cuMap[c.cid]){c.id=custNextId++;customers.push(c);}else{const e=cuMap[c.cid];e.addr=e.addr||c.addr;e.phone=e.phone||c.phone;if((c.lastDate||"")>(e.lastDate||""))e.lastDate=c.lastDate;}});
+  const pSeen=new Set(pipe.map(p=>p.pid));
+  cst.pipe.forEach(p=>{if(!pSeen.has(p.pid)){p.id=nextPipeId++;pipe.push(p);}});
+  if(cloud.seriesSubs)cloud.seriesSubs.forEach(bs=>{const sr=SERIES.find(s=>s.id===bs.id);if(sr&&Array.isArray(bs.sub))bs.sub.forEach(c=>{if(sr.sub.indexOf(c)<0)sr.sub.push(c);});});
+}
+// 旧版客户端（还没刷新页面的）仍会往 main 行写整库 JSON：每 60 秒看一眼，有新写入就把它独有的记录并进来
+async function checkLegacyMain(force){
+  if(!sbClient||!sbConnected)return;
+  if(!force&&Date.now()-_lastMainCheck<60000)return;
+  _lastMainCheck=Date.now();
+  try{
+    const{data}=await sbClient.from(TBL).select("updated_at").eq("data_key","main").maybeSingle();
+    if(!data||!data.updated_at)return;
+    if(data.updated_at===_mainTs)return;
+    if(_migMainTs&&tsNum(data.updated_at)<=tsNum(_migMainTs)){_mainTs=data.updated_at;saveSyncMeta();return;}
+    const{data:row}=await sbClient.from(TBL).select("payload,updated_at").eq("data_key","main").maybeSingle();
+    if(!row)return;
+    _mainTs=row.updated_at;
+    const p=parsePayload(row.payload);
+    if(p&&p.items&&p.items.length){
+      const st=mergeImport(p);
+      ensureIds();items.forEach(recalcItem);recalcCustomerOrders();
+      _legacySeen=true;
+      if(st.newItems+st.newLogs+st.newSN+st.newCust+st.newPipe>0){saveState();if(!isEditing())render();else _renderDeferred=true;}
+    }
+    saveSyncMeta();updateStatus();
+  }catch(e){}
+}
+
+// ═══ 上传（只传有改动的记录）═══
+function schedulePush(delay){
+  if(!sbConnected)return;
+  clearTimeout(_pushTimer);
+  _pushTimer=setTimeout(()=>{_pushTimer=null;pushNow();},delay==null?600:delay);
+}
+async function pushNow(){
+  if(!sbConnected||!sbClient)return;
+  if(_pushInFlight){_pushQueued=true;return;}
+  let pend;
+  try{pend=computePending();}catch(e){console.error(e);return;}
+  _pendingCount=pend.length;updateStatus();
+  if(!pend.length){_retryN=0;return;}
+  _pushInFlight=true;sbSaving=true;
+  const order={meta:0,item:1,log:2,sn:3,cust:4,pipe:5};
+  pend.sort((a,b)=>(order[a.key.split(":")[0]]!==undefined?order[a.key.split(":")[0]]:9)-(order[b.key.split(":")[0]]!==undefined?order[b.key.split(":")[0]]:9));
+  let ok=true,pushed=0;
+  try{
+    for(let i=0;i<pend.length;i+=100){
+      const chunk=pend.slice(i,i+100);
+      const{data,error}=await sbClient.from(TBL).upsert(chunk.map(r=>({data_key:r.key,payload:r.payload})),{onConflict:"data_key"}).select("data_key,updated_at");
+      if(error)throw error;
+      const tsMap={};(data||[]).forEach(r=>{tsMap[r.data_key]=r.updated_at;});
+      let mx="";
+      chunk.forEach(r=>{_hashes[r.key]=r.hash;if(tsMap[r.key]){_seen[r.key]=tsMap[r.key];if(tsNum(tsMap[r.key])>tsNum(mx))mx=tsMap[r.key];}});
+      if(mx)noteServerTime(mx);
+      pushed+=chunk.length;_pendingCount=Math.max(0,pend.length-pushed);updateStatus();
+    }
+    _lastPushAt=Date.now();_retryN=0;_lastErr="";lastSync="☁ "+nowStr();
+  }catch(e){ok=false;_lastErr=String(e.message||e);_retryN++;console.error("上传失败:",e);}
+  sbSaving=false;_pushInFlight=false;
+  try{_pendingCount=computePending().length;}catch(e){}
+  saveSyncMeta();updateStatus();
+  if(!ok){schedulePush(Math.min(60000,3000*Math.pow(2,Math.min(_retryN,5))));}
+  else if(_pushQueued||_pendingCount>0){_pushQueued=false;schedulePush(300);}
+  else{if(pushed>0)maybeSnapshot();if(pushed>0&&(V==="sync"||V==="dash")&&!isEditing())render();}
+}
+
+// ═══ 下载（只拉别人改过的记录，按记录合并进本机）═══
+async function pullNow(full){
+  if(!sbClient||!sbConnected||_pullInFlight)return;
+  _pullInFlight=true;
+  let changed=false;const affected=new Set();
+  try{
+    // 用 10 秒重叠窗口防止服务器事务提交乱序漏掉记录；重复的行靠 _seen 去重
+    let since=full||!_lastPull?"":new Date(Math.max(0,tsNum(_lastPull)-10000)).toISOString();
+    let cursor=_lastPull;let guard=0;let offset=0;const PAGE=500;
+    while(guard++<80){
+      let q=sbClient.from(TBL).select("data_key,payload,updated_at").not("data_key","like","snap%").neq("data_key","main").order("updated_at",{ascending:true}).order("data_key",{ascending:true}).range(offset,offset+PAGE-1);
+      if(since)q=q.gte("updated_at",since);
+      const{data,error}=await q;
+      if(error)throw error;
+      if(!data||!data.length)break;
+      for(const r of data){
+        if(tsNum(r.updated_at)>tsNum(cursor))cursor=r.updated_at;
+        if(_seen[r.data_key]===r.updated_at)continue;
+        _seen[r.data_key]=r.updated_at;
+        const p=parsePayload(r.payload);
+        try{if(applyRow(r.data_key,p,r.updated_at,affected))changed=true;}catch(e){console.error("应用云端记录失败",r.data_key,e);}
+      }
+      if(data.length<PAGE)break;
+      const first=data[0].updated_at,last=data[data.length-1].updated_at;
+      // 下一页：从最后一个时间戳继续；若整页都是同一时间戳（大批量写入），改用偏移量翻页
+      if(last===first){offset+=PAGE;}
+      else{since=last;offset=0;}
+    }
+    if(tsNum(cursor)>tsNum(_lastPull))_lastPull=cursor;
+    _lastPullAt=Date.now();_lastErr="";
+  }catch(e){console.error("拉取失败:",e);_lastErr=String(e.message||e);}
+  _pullInFlight=false;
+  if(affected.size){affected.forEach(iid=>{const it=items.find(x=>x.iid===iid);if(it)recalcItem(it);});}
+  if(changed){recalcCustomerOrders();afterRemoteChange();}
+  saveSyncMeta();updateStatus();
+}
+function afterRemoteChange(){
+  saveLocalOnly();_lastFingerprint=fingerprint();
+  if(isEditing()){_renderDeferred=true;}else{render();}
+}
+// 把云端一行应用到本机。返回是否改变了本机数据
+function applyRow(key,p,ts,affected){
+  if(!p||typeof p!=="object")return false;
+  const i=key.indexOf(":");const type=i<0?key:key.slice(0,i),id=i<0?"":key.slice(i+1);
+  if(type==="dev"){if(id!==_devId){_devices[id]=Object.assign({},p,{_ts:ts});}return false;}
+  if(type==="meta"){
+    if(isPendingKey(key))return false;
+    if(p.mainTs&&!_migMainTs){_migMainTs=p.mainTs;if(!_mainTs)_mainTs=p.mainTs;}
+    const before=JSON.stringify(getSeriesSubs());
+    applySeriesSubs(p.seriesSubs);
+    _hashes[key]=hashOf(stableJSON(metaPayload()));
+    return JSON.stringify(getSeriesSubs())!==before;
+  }
+  const h=p.del?"DEL":hashOf(stableJSON(p));
+  if(type==="item"){
+    const idx=items.findIndex(x=>x.iid===id);
+    if(p.del){if(idx>=0){trashPut("item",items[idx]);items.splice(idx,1);}_hashes[key]="DEL";return idx>=0;}
+    if(idx>=0){
+      if(isPendingKey(key))return false;
+      const it=items[idx];const keepLogs=it.logs,keepId=it.id;
+      for(const k in it){if(k!=="id"&&k!=="logs"&&k[0]!=="_")delete it[k];}
+      Object.assign(it,p);it.id=keepId;it.logs=keepLogs||[];it.iid=id;it.att=it.att||[];it.qc=it.qc||{};
+      _hashes[key]=h;affected.add(id);return true;
+    }
+    if(isPendingDelete(key))return false; // 本机刚删掉、墓碑还没传上去
+    const it=Object.assign({},p,{id:nextId++,iid:id,logs:[]});
+    it.att=it.att||[];it.qc=it.qc||{};
+    if(_orphans[id]){_orphans[id].forEach(lg=>{if(!it.logs.some(x=>x.uid===lg.uid))it.logs.push(lg);});delete _orphans[id];}
+    items.push(it);_hashes[key]=h;affected.add(id);return true;
+  }
+  if(type==="log"){
+    if(p.del){
+      _hashes[key]="DEL";let hit=false;
+      for(const it of items){const ix=(it.logs||[]).findIndex(x=>x.uid===id);if(ix>=0){it.logs.splice(ix,1);affected.add(it.iid);hit=true;break;}}
+      for(const o in _orphans){_orphans[o]=_orphans[o].filter(x=>x.uid!==id);}
+      return hit;
+    }
+    const lg=Object.assign({},p);const iid=lg.iid;delete lg.iid;lg.uid=lg.uid||id;
+    const it=items.find(x=>x.iid===iid);
+    if(!it){_hashes[key]=h;if(_hashes["item:"+iid]!=="DEL"){(_orphans[iid]=_orphans[iid]||[]).push(lg);}return false;}
+    const ex=it.logs.findIndex(x=>x.uid===lg.uid);
+    if(ex>=0){if(isPendingKey(key))return false;it.logs[ex]=lg;}
+    else it.logs.push(lg);
+    _hashes[key]=h;affected.add(iid);return true;
+  }
+  if(type==="sn"){
+    const idx=shipNotes.findIndex(x=>x.sid===id);
+    if(p.del){if(idx>=0){trashPut("sn",shipNotes[idx]);shipNotes.splice(idx,1);}_hashes[key]="DEL";return idx>=0;}
+    if(idx>=0){
+      if(isPendingKey(key))return false;
+      const keepId=shipNotes[idx].id;shipNotes[idx]=Object.assign({},p,{id:keepId,sid:id});
+    }else{
+      if(isPendingDelete(key))return false;
+      shipNotes.push(Object.assign({},p,{id:snNextId++,sid:id}));
+    }
+    shipNotes.sort((a,b)=>String(b.no||"").localeCompare(String(a.no||"")));
+    _hashes[key]=h;return true;
+  }
+  if(type==="cust"){
+    const idx=customers.findIndex(x=>x.cid===id);
+    if(p.del){if(idx>=0){trashPut("cust",customers[idx]);customers.splice(idx,1);}_hashes[key]="DEL";return idx>=0;}
+    if(idx>=0){if(isPendingKey(key))return false;const keepId=customers[idx].id;customers[idx]=Object.assign({},p,{id:keepId,cid:id});}
+    else{if(isPendingDelete(key))return false;customers.push(Object.assign({},p,{id:custNextId++,cid:id}));}
+    _hashes[key]=h;return true;
+  }
+  if(type==="pipe"){
+    const idx=pipe.findIndex(x=>x.pid===id);
+    if(p.del){if(idx>=0){trashPut("pipe",pipe[idx]);pipe.splice(idx,1);}_hashes[key]="DEL";return idx>=0;}
+    if(idx>=0){if(isPendingKey(key))return false;const keepId=pipe[idx].id;pipe[idx]=Object.assign({},p,{id:keepId,pid:id});}
+    else{if(isPendingDelete(key))return false;pipe.push(Object.assign({},p,{id:nextPipeId++,pid:id}));}
+    _hashes[key]=h;return true;
+  }
+  return false;
+}
+
+// 每 5 秒：拉取别人的改动；有待上传的就补传；每 2 小时做一次全量校对
+async function pollCloud(){
+  if(!sbConnected||!sbClient)return;
+  if(_renderDeferred&&!isEditing()){_renderDeferred=false;render();}
+  const full=Date.now()-_lastFullPullAt>2*60*60*1000;
+  if(full)_lastFullPullAt=Date.now();
+  await pullNow(full);
+  if(_pendingCount>0&&!_pushInFlight&&!_pushTimer)schedulePush(0);
+  checkLegacyMain(false);
+}
+window.addEventListener("online",()=>{if(sbConnected){_retryN=0;schedulePush(0);pullNow(false);}else ensureConnected();});
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&sbConnected){pullNow(false);schedulePush(0);}});
+
+// 手动「立即同步」
+async function manualSync(){
+  if(!sbConnected)return nav("sync");
+  _retryN=0;clearTimeout(_pushTimer);_pushTimer=null;
+  await pushNow();await pullNow(true);await heartbeat();
+  updateStatus();
+}
+
+// ═══ 状态指示器（每页右上角）═══
+function otherDevicesOnline(){
+  const now=serverNow();
+  return Object.keys(_devices).filter(k=>now-tsNum(_devices[k]._ts)<95000).map(k=>_devices[k].name||k);
+}
+function updateStatus(){
+  let el=document.getElementById("syncPill");
+  if(!el){
+    el=document.createElement("div");el.id="syncPill";
+    el.onclick=()=>{if(!sbConnected)nav("sync");else manualSync();};
+    document.body.appendChild(el);
+  }
+  let cls="",txt="";
+  const t=_lastPushAt||_lastPullAt;
+  const tm=t?new Date(t).toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit"}):"";
+  if(!sbConnected){
+    if(getSBConfig()){cls="warn";txt="☁ 连接中…";}
+    else{cls="off";txt="☁ 未配置云同步";}
+  }else if(_initialSyncing){cls="warn";txt=_pendingCount>0?`⬆ 首次同步 · 上传 ${_pendingCount} 条…`:"⬇ 首次同步 · 下载中…";}
+  else if(_lastErr&&_pendingCount>0){cls="err";txt=`⚠ 网络异常 · ${_pendingCount} 条待上传 · 自动重试中`;}
+  else if(_lastErr){cls="err";txt="⚠ 网络异常 · 自动重试中";}
+  else if(_pushInFlight||_pendingCount>0){cls="warn";txt=`⬆ 正在上传 ${_pendingCount} 条`;}
+  else{
+    const others=otherDevicesOnline();
+    cls="ok";txt=`☁ 已同步${tm?" "+tm:""}`+(others.length?` · <span class="dot"></span>${others.join("、")} 在线`:"");
+  }
+  el.className=cls;el.innerHTML=txt;
+  let lb=document.getElementById("legacyWarn");
+  if(_legacySeen){
+    if(!lb){lb=document.createElement("div");lb.id="legacyWarn";document.body.appendChild(lb);}
+    lb.innerHTML=`⚠ 检测到有电脑还在用旧版本页面（其登记已自动并入）。请让所有人在浏览器按 <b>Ctrl+F5</b> 刷新到新版本。<span onclick="_legacySeen=false;updateStatus()" style="cursor:pointer;margin-left:10px;text-decoration:underline">知道了</span>`;
+  }else if(lb)lb.remove();
+  fixBannerPadding();
+}
+
+// ═══ 云端快照（整库留档，用于灾难恢复）═══
+function snapshotPayload(){
+  const its=items||[];
+  return{v:FMT_VER,items:its,shipNotes,customers,pipe,seriesSubs:getSeriesSubs(),savedAt:serverNow(),by:_devName,
+    summary:{items:its.length,io:its.reduce((s,i)=>s+((i.logs&&i.logs.length)||0),0),sn:(shipNotes||[]).length,cust:(customers||[]).length,stock:roundQty(its.reduce((s,i)=>s+(i.n||0),0))}};
+}
+async function maybeSnapshot(){
+  if(Date.now()-_lastSnapAt<20*60*1000)return;
+  await makeSnapshot();
+}
+async function makeSnapshot(){
+  if(!sbClient||!sbConnected)return false;
+  try{
+    if(!items||!items.length)return false;
+    const key="snap_"+serverNow();
+    const{error}=await sbClient.from(TBL).upsert({data_key:key,payload:snapshotPayload()},{onConflict:"data_key"});
+    if(error)throw error;
+    _lastSnapAt=Date.now();saveSyncMeta();
+    const{data:all}=await sbClient.from(TBL).select("data_key").like("data_key","snap%");
+    if(all&&all.length>30){
+      const keys=all.map(r=>r.data_key).sort((a,b)=>(parseInt(a.replace(/\D/g,""))||0)-(parseInt(b.replace(/\D/g,""))||0));
+      const del=keys.slice(0,all.length-30);
+      for(const k of del){try{await sbClient.from(TBL).delete().eq("data_key",k);}catch(e){}}
+    }
+    return true;
+  }catch(e){console.error("快照失败",e);return false;}
+}
+async function listSnapshots(){
+  if(!sbClient||!sbConnected)return[];
+  try{
+    const{data}=await sbClient.from(TBL).select("data_key,updated_at,summary:payload->summary,by:payload->>by").like("data_key","snap%");
+    if(!data)return[];
+    const out=[];
+    for(const r of data){
+      const at=parseInt(r.data_key.replace(/\D/g,""))||tsNum(r.updated_at);
+      let s=r.summary;
+      if(!s){ // 旧版快照没有摘要，单独读取
+        try{const{data:row}=await sbClient.from(TBL).select("payload").eq("data_key",r.data_key).maybeSingle();
+          const p=row?parsePayload(row.payload):null;const its=(p&&p.items)||[];
+          s={items:its.length,io:its.reduce((x,i)=>x+((i.logs&&i.logs.length)||0),0),sn:((p&&p.shipNotes)||[]).length,cust:((p&&p.customers)||[]).length,stock:roundQty(its.reduce((x,i)=>x+(i.n||0),0)),legacy:true};
+        }catch(e){s={items:"?",io:"?",sn:"?",cust:"?",stock:"?"};}
+      }
+      out.push({key:r.data_key,at,by:r.by||"",items:s.items,io:s.io,sn:s.sn,cust:s.cust,stock:s.stock,legacy:!!s.legacy});
+    }
+    return out.sort((a,b)=>b.at-a.at);
+  }catch(e){console.error(e);return[];}
+}
+// 用一份完整数据（快照/导入文件）替换本机数据，并以本机为准覆盖云端
+function adoptState(p){
+  items=Array.isArray(p.items)?p.items:[];
+  shipNotes=Array.isArray(p.shipNotes)?p.shipNotes:[];
+  customers=Array.isArray(p.customers)?p.customers:[];
+  pipe=Array.isArray(p.pipe)?p.pipe:(pipe||[]);
+  applySeriesSubs(p.seriesSubs);
+  items.forEach((it,i)=>{it.id=i;it.logs=Array.isArray(it.logs)?it.logs:[];it.att=it.att||[];it.qc=it.qc||{};
+    // 以文件里的库存数为准：重算基数
+    const n=Number(it.n)||0;let s=0;it.logs.forEach(lg=>{s+=logDelta(lg);});it.base=roundQty(n-s);});
+  ensureIds();
+  items.forEach(recalcItem);
+  nextId=items.length?Math.max(...items.map(i=>i.id))+1:0;
+  nextPipeId=pipe.length?Math.max(...pipe.map(x=>x.id||0))+1:1;
+  shipNotes.forEach((s,i)=>{s.id=i+1;});snNextId=shipNotes.length+1;
+  customers.forEach((c,i)=>{c.id=i+1;});custNextId=customers.length+1;
+  recalcCustomerOrders();
+  selId=null;
+  saveLocalOnly();_lastFingerprint=fingerprint();
+}
+async function restoreSnapshot(key){
+  if(!sbClient)return;
+  try{
+    const{data}=await sbClient.from(TBL).select("payload").eq("data_key",key).maybeSingle();
+    if(!data||!data.payload)return alert("该快照读取失败");
+    const p=parsePayload(data.payload);
+    if(!p||!p.items)return alert("该快照数据无效");
+    await makeSnapshot(); // 恢复前先把当前状态存一份
+    adoptState(p);
+    await forcePushAll();
+    alert("已恢复到该版本\n产品 "+items.length+" 条 · 出库单 "+shipNotes.length+" 张 · 客户 "+customers.length+" 位\n已同步到云端，其他电脑几秒后自动更新");
+    V="sync";render();
+  }catch(e){alert("恢复失败: "+e.message);}
+}
+// 本机为准：所有记录重新上传；云端有而本机没有的记录标记删除
+async function forcePushAll(){
+  if(!sbClient||!sbConnected)return alert("未连接云数据库");
+  try{
+    const rows=localRows();
+    const{data}=await sbClient.from(TBL).select("data_key,del:payload->del").not("data_key","like","snap%");
+    _hashes={};
+    (data||[]).forEach(r=>{const k=r.data_key;if(k==="main"||k.indexOf("dev:")===0||r.del)return;if(!rows[k])_hashes[k]="X";});
+    _orphans={};
+    _seen={};
+    await pushNow();
+    _lastSnapAt=0;await makeSnapshot();
+  }catch(e){alert("上传失败: "+(e.message||e));}
+}
+// 云端为准：丢弃本机未上传的改动，全部重新下载
+async function forcePullAll(){
+  if(!sbClient||!sbConnected)return alert("未连接云数据库");
+  _hashes={};_seen={};_lastPull="";_orphans={};
+  items=[];shipNotes=[];customers=[];pipe=[];
+  _firstSync=false;
+  await pullNow(true);
+  items.forEach(recalcItem);recalcCustomerOrders();
+  saveLocalOnly();saveSyncMeta();render();
+}
+// 云端校验：比对本机与云端的记录数
+async function verifyCloud(){
+  if(!sbClient||!sbConnected)return alert("未连接云数据库");
+  try{
+    const{data}=await sbClient.from(TBL).select("data_key,del:payload->del").not("data_key","like","snap%").neq("data_key","main").not("data_key","like","dev:%");
+    const cloud=new Set();(data||[]).forEach(r=>{if(!r.del)cloud.add(r.data_key);});
+    const rows=localRows();
+    const onlyLocal=Object.keys(rows).filter(k=>!cloud.has(k));
+    const onlyCloud=[...cloud].filter(k=>!rows[k]&&k.indexOf("log:")!==0);
+    const pend=computePending().length;
+    const cnt=t=>Object.keys(rows).filter(k=>k.indexOf(t+":")===0).length;
+    const ccnt=t=>[...cloud].filter(k=>k.indexOf(t+":")===0).length;
+    let msg=`本机：产品 ${cnt("item")} · 出入库 ${cnt("log")} · 出库单 ${cnt("sn")} · 客户 ${cnt("cust")}\n云端：产品 ${ccnt("item")} · 出入库 ${ccnt("log")} · 出库单 ${ccnt("sn")} · 客户 ${ccnt("cust")}\n\n`;
+    msg+=`待上传改动：${pend} 条\n本机有、云端没有：${onlyLocal.length} 条（将自动补传）\n云端有、本机没有：${onlyCloud.length} 条（将自动拉取）`;
+    alert(msg);
+    if(onlyLocal.length||pend)schedulePush(0);
+    if(onlyCloud.length)await pullNow(true);
+  }catch(e){alert("校验失败: "+(e.message||e));}
 }
 
 // ═══ 货号更正（2026-10-04）═══
@@ -649,21 +1079,23 @@ function openFix20261004(){
   </div>`;
   document.body.appendChild(ov);
 }
-function doFix20261004(){
+async function doFix20261004(){
   const el=document.getElementById("fixOv");if(el)el.remove();
-  try{localStorage.setItem("RIGOR_INV_before_fix_20261004",JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),shipNotes,customers,savedAt:_savedAt}));}catch(e){console.error("更正前备份失败:",e);}
+  try{localStorage.setItem("RIGOR_INV_before_fix_20261004",JSON.stringify({items,pipe,seriesSubs:getSeriesSubs(),shipNotes,customers,savedAt:serverNow()}));}catch(e){console.error("更正前备份失败:",e);}
+  if(sbConnected){try{await makeSnapshot();}catch(e){}} // 改之前云端先存一个版本，可回滚
   let st;
   try{st=applyFix20261004(items,getSeriesSubs());}catch(e){alert("更正失败："+e.message);return;}
   nextId=items.length?Math.max(...items.map(i=>i.id||0))+1:0;
+  ensureIds();items.forEach(recalcItem);
   saveState();render();
   setTimeout(()=>alert("货号更正完成\n\n更正货号 "+st.recode+" 条 · 补码 "+st.fill+" 条\n染色分类合并 "+st.cat+" 条 · 新增常备档 "+st.add+" 条\n标注疑似重复 "+st.dup+" 条\n\n在搜索框输入「疑似重复」或「待确认」可以找到要人工核对的条目"),200);
 }
 
 function exportData(){
-  const data=JSON.stringify({items,logs:allLogs,pipe,seriesSubs:getSeriesSubs(),shipNotes,customers,lastSync:new Date().toLocaleString("zh-CN"),exportBy:"RIGOR库存系统"},null,2);
+  const data=JSON.stringify({v:FMT_VER,items,pipe,seriesSubs:getSeriesSubs(),shipNotes,customers,lastSync:nowStr(),exportBy:"RIGOR库存系统 v3 · "+_devName},null,2);
   const blob=new Blob([data],{type:"application/json"});
   const url=URL.createObjectURL(blob);
-  const a=document.createElement("a");a.href=url;a.download="RIGOR_库存数据_"+new Date().toISOString().slice(0,10)+".json";
+  const a=document.createElement("a");a.href=url;a.download="RIGOR_库存数据_"+todayStr()+".json";
   a.click();URL.revokeObjectURL(url);
 }
 function importData(){
@@ -713,7 +1145,7 @@ function importData(){
 // 规则：现有产品的库存/字段一律保持不变，只把备份里「缺失的」补进来
 function mergeImport(bak){
   const st={newItems:0,newLogs:0,newSN:0,newCust:0,newPipe:0,skipped:0,dupInBak:0};
-  // ── 产品 ──
+  // ── 产品（按条目编号 uid 认条目）──
   ensureItemUids(items);ensureItemUids(bak.items);
   const cur={};
   items.forEach(i=>{cur[itemKey(i)]=i;});
@@ -728,14 +1160,15 @@ function mergeImport(bak){
       const ni=Object.assign({},bi);
       ni.id=nextId++;
       if(cur[k])ni.uid=newItemUid(); // 和现有条目撞号的，换新号，免得下次同步又被并掉
+      ni.iid=ni.uid;
       ni.qc=ni.qc||{};ni.att=ni.att||[];ni.logs=ni.logs||[];
       const nk=itemKey(ni);
       items.push(ni);cur[nk]=ni;addedNow.add(nk);st.newItems++;
       st.newLogs+=ni.logs.length;
     }else{
-      // 已存在 → 库存和字段一概不动，只补历史出入库记录
-      const seen=new Set((ex.logs||[]).map((x,i)=>logKey(x,i)));
-      const add=(bi.logs||[]).filter((x,i)=>!seen.has(logKey(x,i)));
+      // 已存在 → 只补历史出入库记录（uid / 内容指纹任一相同即视为同一条）
+      const set=logMatchSet(ex);
+      const add=(bi.logs||[]).filter(x=>!logMatches(set,ex,x));
       if(add.length){
         ex.logs=(ex.logs||[]).concat(add);
         st.newLogs+=add.length;
@@ -756,8 +1189,10 @@ function mergeImport(bak){
 
   // ── 出库单：按单号补充 ──
   const snSeen=new Set(shipNotes.map(s=>s.no||JSON.stringify(s.lines)));
+  shipNotes.forEach(s=>{if(s.sid)snSeen.add("sid:"+s.sid);});
   (bak.shipNotes||[]).forEach(bs=>{
     const k=bs.no||JSON.stringify(bs.lines);
+    if(bs.sid&&snSeen.has("sid:"+bs.sid))return;
     if(!snSeen.has(k)){
       const ns=Object.assign({},bs);ns.id=snNextId++;
       shipNotes.push(ns);snSeen.add(k);st.newSN++;
@@ -799,8 +1234,18 @@ function confirmMergeImport(){
   const el=document.getElementById("importOv");if(el)el.remove();
   const d=window._importData;if(!d)return;
   let st;
+  // 合并导入的原则：现有产品的库存数不变。补进来的历史记录只作为历史，不改变当前库存（相应调整基数）
+  const before={};items.forEach(it=>{before[it.iid||itemKey(it)]=roundQty(it.n);});
   try{st=mergeImport(d);}catch(e){alert("合并失败："+e.message);return;}
-  _savedAt=Date.now();
+  ensureIds();
+  items.forEach(it=>{
+    const k=it.iid in before?it.iid:itemKey(it);
+    if(before[k]!==undefined){ // 老产品：保持库存数不变，重算基数
+      let s=0;(it.logs||[]).forEach(lg=>{s+=logDelta(lg);});it.base=roundQty(before[k]-s);
+    }
+    recalcItem(it);
+  });
+  recalcCustomerOrders();
   saveState();render();
   window._importData=null;
   setTimeout(()=>{
@@ -808,29 +1253,27 @@ function confirmMergeImport(){
   },200);
 }
 
-function confirmImport(){
+async function confirmImport(){
   document.getElementById("importOv").remove();
   const d=window._importData;if(!d)return;
-  items=ensureItemUids(d.items);allLogs=d.logs||[];pipe=d.pipe||pipe;
-  applySeriesSubs(d.seriesSubs);
-  // 关键：出库单和客户档案也要恢复
-  if(Array.isArray(d.shipNotes))shipNotes=d.shipNotes;
-  if(Array.isArray(d.customers))customers=d.customers;
-  nextId=items.length?Math.max(...items.map(i=>i.id))+1:0;
-  nextPipeId=pipe.length?Math.max(...pipe.map(p=>p.id))+1:1;
-  snNextId=shipNotes.length?Math.max(...shipNotes.map(n=>n.id||0))+1:1;
-  custNextId=customers.length?Math.max(...customers.map(c=>c.id||0))+1:1;
-  // 导入的数据视为最新，防止被云端旧数据覆盖
-  _savedAt=Date.now();
-  saveState();render();
   window._importData=null;
+  if(sbConnected){try{await makeSnapshot();}catch(e){}} // 覆盖前给云端留一份快照
+  adoptState(d);
+  if(sbConnected){
+    await forcePushAll();
+    alert("已导入并覆盖云端\n产品 "+items.length+" 条 · 出库单 "+shipNotes.length+" 张 · 客户 "+customers.length+" 位\n其他电脑几秒后会自动更新为这份数据");
+  }else{
+    saveState();
+    alert("已导入到本机\n产品 "+items.length+" 条 · 出库单 "+shipNotes.length+" 张 · 客户 "+customers.length+" 位");
+  }
+  V="dash";render();
 }
 function resetToDefault(){
   const ov=document.createElement("div");ov.className="overlay";ov.id="resetOv";
   ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
     <div style="font-size:40px;margin-bottom:12px">⚠️</div>
-    <div style="font-size:15px;font-weight:700;color:#f87171;margin-bottom:8px">恢复初始数据？</div>
-    <div style="font-size:13px;color:#9ca3af;margin-bottom:20px">所有修改将丢失，不可撤销！</div>
+    <div style="font-size:15px;font-weight:700;color:#f87171;margin-bottom:8px">清空本机数据？</div>
+    <div style="font-size:13px;color:#9ca3af;margin-bottom:20px;line-height:1.7">只清空这台电脑浏览器里的数据，<b style="color:#34d399">云端数据不受影响</b>。<br>已连接云同步时，刷新后会自动从云端重新下载全部数据。${sbConnected&&computePending().length?`<br><b style="color:#fbbf24">本机还有 ${computePending().length} 条改动没上传，将会丢失！</b>`:""}</div>
     <div style="display:flex;gap:10px">
       <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('resetOv').remove()">取消</button>
       <button class="btn" style="background:#dc2626;flex:1" onclick="confirmReset()">确认恢复</button>
@@ -841,21 +1284,16 @@ function resetToDefault(){
 async function confirmReset(){
   document.getElementById("resetOv").remove();
   localStorage.removeItem("RIGOR_INV");
-  if(sbConnected&&sbClient){
-    try{await sbClient.from("rigor_inventory").delete().eq("data_key","main");}catch(e){}
-  }
+  localStorage.removeItem(SYNC_KEY);
   location.reload();
 }
 
-// Try to init Supabase on load
-const _sbCfg=getSBConfig();
-if(_sbCfg)initSupabase(_sbCfg);
-
+loadSyncMeta();
 if(!loadFromStorage()){
+  _seedData=true; // 没有本地存档 → 用内置示例数据，接入云端时若云端已有数据会自动丢弃示例
   items=RAW.map((d,i)=>({id:i,c:d.c,s:d.s,f:d.f,m:d.m,k:d.k,b:d.b,q:d.q,n:d.n,t:d.t,o:d.o,ln:d.ln||"1",eb:d.eb||"",pr:d.pr||"",spec:d.spec||"",qc:{},logs:[],att:[]}));
   // Auto-generate external batch for items without one
   items.forEach(d=>{if(!d.eb&&d.b)d.eb=genExtBatch(d.c,d.b,d.ln);});
-  ensureItemUids(items);rebaseItemSigs();
   allLogs=[];
   pipe=[
     {id:1,nm:"PET纳米微球多规格攻关",pr:"P0",ph:"Week 1-2",st:"进行中",tg:"300-500nm+500-1μm",nt:"50/100nm已就绪"},
@@ -877,6 +1315,8 @@ let nextId=items.length?Math.max(...items.map(i=>i.id))+1:0;
 if(shipNotes.length&&!customers.length){
   shipNotes.slice().reverse().forEach(sn=>{try{upsertCustomer(sn);}catch(e){}});
 }
+// 给老数据补齐稳定 ID 和库存基数，并按记录重算库存
+ensureIds();items.forEach(recalcItem);recalcCustomerOrders();
 
 let V="dash",selId=null,srch="",serF="全部",stF="全部",subCatF="全部",ptab="all",modal=null,delMode=false;
 window._composing=false;
@@ -977,6 +1417,7 @@ function render(){
   else if(V==="stats")h=rStats();
   else if(V==="cust")h=rCustList();
   else if(V==="snap")h=rSnapshots();
+  else if(V==="trash")h=rTrash();
   h+=`<div class="nav">${[["dash","总览","◉"],["list","库存","☰"],["add","新增","＋"],["snlist","出库单","📋"],["cust","客户","👥"],["stats","统计","📊"],["pipe","研发","🔬"],["sync","同步","☁"]].map(([id,l,i])=>`<button class="${V===id||(id==="snlist"&&(V==="snform"||V==="snview"))?"on":""}" onclick="nav('${id}')"><span style="font-size:16px">${i}</span><span>${l}</span></button>`).join("")}</div>`;
   document.getElementById("app").innerHTML=h;
   bindSearchBox();
@@ -1057,9 +1498,16 @@ function removeCat(seriesId,catName){
 }
 
 // ═══ DASHBOARD ═══
+// 最近出入库：从各产品记录汇总（不再单独存一份操作日志）
+function recentLogs(n){
+  const all=[];
+  items.forEach(it=>{(it.logs||[]).forEach(lg=>{all.push(Object.assign({},lg,{item:it}));});});
+  all.sort((a,b)=>logSortKey(b).localeCompare(logSortKey(a)));
+  return all.slice(0,n);
+}
 function rDash(){
   const sn=items.filter(d=>d.t==="正常").length,sl=items.filter(d=>d.t==="低库存").length,so=items.filter(d=>d.t==="缺货").length,sr2=items.filter(d=>d.t==="研发中").length,sp=items.filter(d=>d.t==="待处理").length;
-  let h=`<div style="padding:20px"><div style="display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:20px"><div style="width:56px;height:56px;border-radius:14px;background:#fff;display:flex;align-items:center;justify-content:center;padding:5px"><img src="${LOGO_URL}" style="width:100%;height:100%;object-fit:contain"></div><div style="text-align:center"><div style="font-size:20px;font-weight:700;color:#fff">Rigor库存管理系统</div><div style="font-size:13px;color:#6b7280">${items.length} SKU · ${sbConnected?(isDirty()?`<span style="color:#fbbf24">☁ 同步中…</span>`:`<span style="color:#34d399">☁ 已同步</span>`):(lastSync?`<span style="color:#fbbf24">本地</span>`:"")}</div></div></div>`;
+  let h=`<div style="padding:20px"><div style="display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:20px"><div style="width:56px;height:56px;border-radius:14px;background:#fff;display:flex;align-items:center;justify-content:center;padding:5px"><img src="${LOGO_URL}" style="width:100%;height:100%;object-fit:contain"></div><div style="text-align:center"><div style="font-size:20px;font-weight:700;color:#fff">Rigor库存管理系统</div><div style="font-size:13px;color:#6b7280">${items.length} SKU · ${sbConnected?(_pendingCount>0?`<span style="color:#fbbf24">☁ 上传中 ${_pendingCount} 条</span>`:`<span style="color:#34d399">☁ 云同步中</span>`):`<span style="color:#fbbf24">仅本机</span>`}</div></div></div>`;
   h+=`<div class="dash-stats" style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:18px">`;
   [{l:"正常",v:sn,c:"#34d399"},{l:"低库存",v:sl,c:"#fbbf24"},{l:"缺货",v:so,c:"#f87171"},{l:"研发中",v:sr2,c:"#c084fc"},{l:"待处理",v:sp,c:"#a78bfa"}].forEach(x=>{h+=`<div class="card" style="cursor:pointer" onclick="jumpToStatus('${x.l}')"><div style="font-size:11px;color:#6b7280">${x.l}</div><div style="font-size:24px;font-weight:700;color:${x.c}">${x.v}</div></div>`;});
   h+=`</div>`;
@@ -1078,7 +1526,8 @@ function rDash(){
   h+=`</div>`;
   h+=`<button class="sm" style="width:100%;background:#1e2130;border:1px solid #2a2e3e;color:#818cf8;margin:10px 0 18px" onclick="nav('pipe')">查看全部管线 →</button>`;
   // Recent logs
-  if(allLogs.length){h+=`<div style="font-size:14px;font-weight:600;color:#9ca3af;margin:4px 0 8px">最近操作</div>`;allLogs.slice(-5).reverse().forEach(l=>{h+=`<div style="padding:7px 0;border-bottom:1px solid #151821;font-size:13px"><span style="color:${l.tp==="in"?"#34d399":"#f87171"}">${l.tp==="in"?"▲入库":"▼出库"}</span><span style="color:#9ca3af;margin-left:8px">${l.nm}</span><span style="color:#fff;margin-left:8px">×${fmtQty(l.qt)}</span></div>`;});}
+  const recent=recentLogs(6);
+  if(recent.length){h+=`<div style="font-size:14px;font-weight:600;color:#9ca3af;margin:4px 0 8px">最近出入库</div>`;recent.forEach(l=>{h+=`<div style="padding:7px 0;border-bottom:1px solid #151821;font-size:13px;display:flex;align-items:center;gap:8px;cursor:pointer" onclick="selId=${l.item.id};V='detail';render()"><span style="color:${l.adj?"#a78bfa":(l.tp==="in"?"#34d399":"#f87171")}">${l.adj?"✎调整":(l.tp==="in"?"▲入库":"▼出库")}</span><span style="color:#9ca3af;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${l.item.s} ${l.item.c}${l.item.f&&l.item.f!=="无"?" "+l.item.f:""}</span><span style="color:#fff">×${fmtQty(l.qt)}</span><span style="color:#4b5563;font-size:11px">${l.dt||""}${l.purpose?" · "+l.purpose:""}</span></div>`;});}
   h+=`</div>`;return h;
 }
 
@@ -1360,8 +1809,9 @@ function doAdd(){
   if(!data){alert("请填写产品分类和粒径/规格");return;}
   // Auto-gen external batch if empty
   if(!data.eb&&data.b)data.eb=genExtBatch(data.c,data.b,data.ln);
-  const newItem={id:nextId++,uid:newItemUid(),...data,q:String(data.n),qc:{},logs:[],att:[]};
-  items.push(newItem);
+  const _u=newItemUid();
+  const newItem={id:nextId++,...data,uid:_u,iid:_u,q:String(data.n),base:roundQty(data.n),qc:{},logs:[],att:[]};
+  items.push(newItem);recalcItem(newItem);
   const sr=fs(data.c);
   if(!sr.sub.includes(data.c)){SERIES[0].sub.push(data.c);}
   selId=newItem.id;saveState();V="detail";render();
@@ -1373,7 +1823,14 @@ function doEdit(id){
   const d=items.find(i=>i.id===id);if(!d)return;
   // Auto-gen external batch if empty and batch changed
   if(!data.eb&&data.b)data.eb=genExtBatch(data.c,data.b,data.ln);
+  const oldN=roundQty(d.n),newN=roundQty(data.n);
   Object.assign(d,data);d.q=String(data.n);
+  if(newN!==oldN){
+    // 在编辑页直接改库存数 → 记成一条「盘点调整」记录，这样两台电脑合并后结果一致
+    const diff=roundQty(newN-oldN);
+    d.logs.push({uid:newUid(),tp:diff>0?"in":"out",qt:Math.abs(diff),bt:d.b||"",dt:todayStr(),pv:oldN,nx:newN,eb:d.eb||"",nt:"编辑页手动修正库存",adj:1,ts:serverNow(),dev:_devName});
+  }
+  recalcItem(d);
   if(!fs(data.c).sub.includes(data.c)){SERIES[0].sub.push(data.c);}
   saveState();V="detail";render();
 }
@@ -1395,6 +1852,7 @@ function doDelete(id){
 }
 function confirmDelete(id){
   document.getElementById("delOv").remove();
+  const it=items.find(i=>i.id===id);if(it)trashPut("item",it);
   items=items.filter(i=>i.id!==id);
   saveState();V="list";selId=null;render();
 }
@@ -1409,7 +1867,7 @@ function rDetail(){
   // Info + edit button
   h+=`<div class="card" style="cursor:default"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-size:12px;font-weight:600;color:#9ca3af">产品信息</span><div style="display:flex;gap:6px"><button class="edit-btn" onclick="V='edit';render()">✏️ 编辑</button><button class="del-btn" onclick="doDelete(${d.id})">🗑️ 删除</button></div></div>`;
   h+=`<div class="detail-info" style="display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;font-size:13px">`;
-  [["型号",d.m],["货号",d.k],["内部批号",d.b],["库存原始",d.q||String(d.n)]].forEach(([l,v])=>{h+=`<div><span style="color:#6b7280">${l}：</span><span style="color:#e5e7eb">${v||"—"}</span></div>`;});
+  [["型号",d.m],["货号",d.k],["内部批号",d.b],["库存基数",fmtQty(d.base)+" + 记录 "+(d.logs||[]).length+" 条"]].forEach(([l,v])=>{h+=`<div><span style="color:#6b7280">${l}：</span><span style="color:#e5e7eb">${v||"—"}</span></div>`;});
   h+=`</div>`;
   // External batch display
   const extB=d.eb||genExtBatch(d.c,d.b,d.ln);
@@ -1455,7 +1913,7 @@ function rDetail(){
   // Logs
   h+=`<div class="card" style="cursor:default"><div style="font-size:12px;font-weight:600;color:#9ca3af;margin-bottom:6px">📋 出入库记录</div>`;
   if(!d.logs.length)h+=`<div style="font-size:11px;color:#4b5563;text-align:center;padding:8px">暂无</div>`;
-  else d.logs.slice().reverse().forEach(l=>{h+=`<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #1a1d27;font-size:11px"><span style="color:${l.tp==="in"?"#34d399":"#f87171"};font-weight:600">${l.tp==="in"?"▲入":"▼出"}</span><span style="color:#fff">×${fmtQty(l.qt)}</span><span style="color:#4b5563">${l.pv}→${l.nx}</span>${l.bt?`<span style="color:#818cf8;font-size:9px">${l.bt}</span>`:""}<span style="color:#4b5563;margin-left:auto">${l.dt}</span></div>`;});
+  else d.logs.slice().reverse().forEach(l=>{h+=`<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #1a1d27;font-size:11px;flex-wrap:wrap"><span style="color:${l.adj?"#a78bfa":(l.tp==="in"?"#34d399":"#f87171")};font-weight:600">${l.adj?"✎调":(l.tp==="in"?"▲入":"▼出")}</span><span style="color:#fff">×${fmtQty(l.qt)}</span><span style="color:#4b5563">${fmtQty(l.pv)}→${fmtQty(l.nx)}</span>${l.bt?`<span style="color:#818cf8;font-size:9px">${l.bt}</span>`:""}${l.purpose?`<span style="color:#6b7280;font-size:9px">${l.purpose}</span>`:""}${l.sn?`<span style="color:#60a5fa;font-size:9px;cursor:pointer" onclick="openSNByNo('${l.sn}')">📋${l.sn}</span>`:""}${l.dev?`<span style="color:#374151;font-size:9px">${l.dev}</span>`:""}<span style="color:#4b5563;margin-left:auto">${l.dt}</span></div>`;});
   h+=`</div></div>`;return h;
 }
 
@@ -1469,13 +1927,14 @@ function rInOut(){
   h+=`<div class="form-row"><div class="form-label">内部批号</div><input class="inp" id="ioBat" value="${d.b||""}" placeholder="如 20260316" oninput="updateIOExtBatch()"></div>`;
   const curExtB=d.eb||genExtBatch(d.c,d.b,d.ln);
   h+=`<div style="padding:8px 10px;border-radius:6px;background:#1e3a5f30;border:1px solid #2563eb30;margin-bottom:10px"><div style="font-size:10px;color:#60a5fa;margin-bottom:2px">🏷️ 对应客户批号</div><div id="ioExtBat" style="font-size:16px;font-weight:700;color:#fff;font-family:monospace;letter-spacing:1px">${curExtB||"—"}</div></div>`;
-  h+=`<div class="form-row"><div class="form-label">日期</div><input class="inp" type="date" id="ioDt" value="${new Date().toISOString().slice(0,10)}"></div>`;
+  h+=`<div class="form-row"><div class="form-label">日期</div><input class="inp" type="date" id="ioDt" value="${todayStr()}"></div>`;
   if(!isIn){h+=`<div class="form-row"><div class="form-label">出库用途 *</div><select class="inp" id="ioPurpose"><option value="淘宝">淘宝</option><option value="经销商">经销商</option><option value="海外客户">海外客户</option><option value="研发&生产">研发&生产</option><option value="其他">其他</option></select></div>`;}
   h+=`<div class="form-row"><div class="form-label">备注</div><textarea class="inp" id="ioNt" rows="2" style="resize:vertical"></textarea></div>`;
   h+=`<button class="btn" style="background:${cl}" onclick="doIO()">确认${isIn?"入库":"出库"}</button></div>`;
   return h;
 }
 
+function openSNByNo(no){const sn=shipNotes.find(s=>s.no===no);if(!sn)return alert("未找到出库单 "+no);selId=sn.id;V="snview";render();}
 function startIO(id,tp){selId=id;modal={tp};V="inout";render();}
 function doIO(){
   const d=items.find(i=>i.id===selId);if(!d)return;
@@ -1483,12 +1942,13 @@ function doIO(){
   const bt=document.getElementById("ioBat").value,dt=document.getElementById("ioDt").value;
   const nt=document.getElementById("ioNt")?document.getElementById("ioNt").value:"";
   const purpose=document.getElementById("ioPurpose")?document.getElementById("ioPurpose").value:"";
-  const pv=d.n,nx=roundQty(modal.tp==="in"?d.n+qt:Math.max(0,d.n-qt));
-  d.n=nx;d.t=stockStatus(nx);
+  if(modal.tp==="out"&&qt>roundQty(d.n)&&!confirm("当前库存只有 "+fmtQty(d.n)+"，出库 "+fmtQty(qt)+" 后库存会变成负数。\n确定要继续吗？（负数说明之前的入库没登记，可之后用「编辑」修正）"))return;
+  const pv=roundQty(d.n),nx=roundQty(modal.tp==="in"?d.n+qt:d.n-qt);
   if(modal.tp==="in"&&bt){d.b=bt;d.eb=genExtBatch(d.c,bt,d.ln);}
-  const _uid=Date.now().toString(36)+Math.random().toString(36).slice(2,7);
-  d.logs.push({uid:_uid,tp:modal.tp,qt,bt,dt,pv,nx,eb:d.eb,nt,purpose});
-  allLogs.push({tp:modal.tp,qt,dt,nm:d.s+" "+d.c,purpose});
+  const _uid=newUid();
+  // 库存 = 基数 + 所有记录；只追加记录，不直接改库存数，两台电脑同时登记也不会互相覆盖
+  d.logs.push({uid:_uid,tp:modal.tp,qt,bt,dt,pv,nx,eb:d.eb,nt,purpose,ts:serverNow(),dev:_devName});
+  recalcItem(d);
   // After outbound, offer to generate shipping note
   if(modal.tp==="out"){
     modal=null;saveState();
@@ -1497,10 +1957,10 @@ function doIO(){
       <div style="font-size:40px;margin-bottom:12px">✅</div>
       <div style="font-size:15px;font-weight:700;color:#fff;margin-bottom:8px">出库成功</div>
       <div style="font-size:13px;color:#9ca3af;margin-bottom:6px">${d.s} ${d.c} × ${qt}</div>
-      <div style="font-size:12px;color:#6b7280;margin-bottom:20px">库存: ${pv} → ${nx}</div>
+      <div style="font-size:12px;color:#6b7280;margin-bottom:20px">库存: ${fmtQty(pv)} → ${fmtQty(d.n)}</div>
       <div style="display:flex;gap:10px">
         <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('snOv').remove();V='detail';render()">返回</button>
-        <button class="btn" style="background:#2563eb;flex:1" onclick="document.getElementById('snOv').remove();startSNFromIO(${d.id},${qt},'${bt}','${dt}')">生成出库单</button>
+        <button class="btn" style="background:#2563eb;flex:1" onclick="document.getElementById('snOv').remove();startSNFromIO(${d.id},${qt},'${bt}','${dt}','${_uid}')">生成出库单</button>
       </div>
     </div>`;
     document.body.appendChild(ov);
@@ -1521,14 +1981,15 @@ function getCatName(c){
   const map={"PS微球":"单分散聚苯乙烯微球","PMMA微球":"单分散PMMA微球","PET微球":"单分散PET微球","功能化PS微球":"功能化聚苯乙烯微球","PE微球":"聚乙烯微球","PP微球":"聚丙烯微球","PVC微球":"聚氯乙烯微球"};
   return map[c]||c;
 }
-function startSNFromIO(itemId,qty,batch,dt){
+function startSNFromIO(itemId,qty,batch,dt,uid){
   const d=items.find(i=>i.id===itemId);if(!d)return;
   const eb=d.eb||genExtBatch(d.c,d.b,d.ln);
-  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:dt||new Date().toISOString().slice(0,10),note:"",pack:"纸盒包装",lines:[{k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s+(d.f&&d.f!=="无"?" "+d.f:""),spec:d.spec||"10ml 2.5wt%",unit:"瓶",qty}]};
+  // fromIO：库存已在出库时扣过，出库单保存时默认不再扣；ioUid 用于把出库记录和出库单关联起来（批次溯源）
+  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:dt||todayStr(),note:"",pack:"纸盒包装",fromIO:true,ioUids:uid?[uid]:[],deduct:false,purpose:"",lines:[{k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s+(d.f&&d.f!=="无"?" "+d.f:""),spec:d.spec||"10ml 2.5wt%",unit:"瓶",qty,iid:d.iid}]};
   V="snform";render();
 }
 function startNewSN(){
-  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:new Date().toISOString().slice(0,10),note:"",pack:"纸盒包装",lines:[{k:"",eb:"",name:"",spec:"10ml 2.5wt%",unit:"瓶",qty:1}]};
+  snDraft={to_name:"",to_phone:"",to_addr:"",ship_dt:todayStr(),note:"",pack:"纸盒包装",fromIO:false,deduct:true,purpose:"经销商",lines:[{k:"",eb:"",name:"",spec:"10ml 2.5wt%",unit:"瓶",qty:1}]};
   V="snform";render();
 }
 function rSNForm(){
@@ -1561,6 +2022,17 @@ function rSNForm(){
     h+=`</div></div>`;
   });
   h+=`</div>`;
+  // Stock deduction
+  h+=`<div class="card" style="cursor:default;border-color:${snDraft.deduct?"#dc262660":"#1e2130"}"><div style="font-size:13px;font-weight:600;color:#f87171;margin-bottom:8px">📉 库存扣减</div>`;
+  if(snDraft.fromIO){
+    h+=`<div style="font-size:12px;color:#34d399;margin-bottom:6px">✓ 这张出库单来自刚才的出库操作，库存已经扣过，保存时不会重复扣减</div>`;
+    h+=`<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:#9ca3af;cursor:pointer"><input type="checkbox" id="sn_deduct" ${snDraft.deduct?"checked":""} onchange="syncSNDraft();render()" style="width:16px;height:16px"> 后来补加的明细行也扣库存（已扣过的首行不会重复）</label>`;
+  }else{
+    h+=`<label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#e5e7eb;cursor:pointer;margin-bottom:8px"><input type="checkbox" id="sn_deduct" ${snDraft.deduct?"checked":""} onchange="syncSNDraft();render()" style="width:16px;height:16px"> 保存出库单时按明细自动扣减库存（按货号+批号匹配产品）</label>`;
+    h+=`<div style="font-size:11px;color:#6b7280;margin-bottom:6px">勾选后每一行明细都会生成一条出库记录，库存自动减少；不勾选则只保存单据，库存不变</div>`;
+  }
+  h+=`<div class="form-row" style="margin-top:6px"><div class="form-label">出库用途（用于统计）</div><select class="inp" id="sn_purpose">${["经销商","淘宝","海外客户","研发&生产","其他"].map(p=>`<option value="${p}" ${snDraft.purpose===p?"selected":""}>${p}</option>`).join("")}</select></div>`;
+  h+=`</div>`;
   // Other info
   h+=`<div class="card" style="cursor:default"><div style="font-size:13px;font-weight:600;color:#9ca3af;margin-bottom:8px">📝 其他信息</div>`;
   h+=`<div class="form-row"><div class="form-label">外包装</div><input class="inp" id="sn_pack" value="${snDraft.pack}"></div>`;
@@ -1576,6 +2048,8 @@ function syncSNDraft(){
   const gv=id=>{const e=document.getElementById(id);return e?e.value:"";};
   snDraft.to_name=gv("sn_name");snDraft.to_phone=gv("sn_phone");snDraft.to_addr=gv("sn_addr");
   snDraft.pack=gv("sn_pack");snDraft.ship_dt=gv("sn_dt");snDraft.note=gv("sn_note");
+  const dd=document.getElementById("sn_deduct");if(dd)snDraft.deduct=dd.checked;
+  const pp=document.getElementById("sn_purpose");if(pp)snDraft.purpose=pp.value;
   document.querySelectorAll(".sn-f").forEach(el=>{
     const idx=parseInt(el.dataset.idx),key=el.dataset.key;
     if(snDraft.lines[idx])snDraft.lines[idx][key]=key==="qty"?(roundQty(parseFloat(el.value))||1):el.value;
@@ -1606,7 +2080,7 @@ function snPickItem(idx,itemId){
   syncSNDraft();
   const d=items.find(i=>i.id===itemId);if(!d||!snDraft)return;
   const eb=d.eb||genExtBatch(d.c,d.b,d.ln);
-  snDraft.lines[idx]={k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s+(d.f&&d.f!=="无"?" "+d.f:""),spec:d.spec||"10ml 2.5wt%",unit:"瓶",qty:snDraft.lines[idx].qty||1};
+  snDraft.lines[idx]={k:d.k,eb:eb,name:getCatName(d.c)+" "+d.s+(d.f&&d.f!=="无"?" "+d.f:""),spec:d.spec||"10ml 2.5wt%",unit:"瓶",qty:snDraft.lines[idx].qty||1,iid:d.iid};
   render();
 }
 // Close search dropdown when clicking outside
@@ -1622,13 +2096,13 @@ function upsertCustomer(sn){
     c.phone=phone||c.phone;
     c.addr=(sn.to_addr||"").trim()||c.addr;
     c.orders=(c.orders||0)+1;
-    c.lastDate=sn.ship_dt||new Date().toISOString().slice(0,10);
+    c.lastDate=sn.ship_dt||todayStr();
     if(sn.pack)c.pack=sn.pack;
     if(sn.note)c.note=sn.note;
   }else{
-    customers.push({id:custNextId++,name,phone,addr:(sn.to_addr||"").trim(),
-      orders:1,lastDate:sn.ship_dt||new Date().toISOString().slice(0,10),
-      pack:sn.pack||"",note:sn.note||"",created:new Date().toLocaleString("zh-CN")});
+    customers.push({id:custNextId++,cid:"C"+h32(name+"|"+phone),name,phone,addr:(sn.to_addr||"").trim(),
+      orders:1,lastDate:sn.ship_dt||todayStr(),
+      pack:sn.pack||"",note:sn.note||"",created:nowStr()});
   }
 }
 function custSearch(q){
@@ -1685,7 +2159,7 @@ function rCustListBody(){
 function newSNForCustomer(cid){
   const c=customers.find(x=>x.id===cid);if(!c)return;
   snDraft={to_name:c.name,to_phone:c.phone||"",to_addr:c.addr||"",
-    ship_dt:new Date().toISOString().slice(0,10),note:c.note||"",pack:c.pack||"纸盒包装",
+    ship_dt:todayStr(),note:c.note||"",pack:c.pack||"纸盒包装",fromIO:false,deduct:true,purpose:"经销商",
     lines:[{k:"",eb:"",name:"",spec:"10ml 2.5wt%",unit:"瓶",qty:1}]};
   V="snform";render();
 }
@@ -1721,20 +2195,56 @@ function delCust(cid){
     <div style="font-size:12px;color:#6b7280;margin-bottom:20px">已有出库单记录不受影响</div>
     <div style="display:flex;gap:10px">
       <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('delCustOv').remove()">取消</button>
-      <button class="btn" style="background:#dc2626;flex:1" onclick="document.getElementById('delCustOv').remove();customers=customers.filter(x=>x.id!==${cid});saveState();render()">确认删除</button>
+      <button class="btn" style="background:#dc2626;flex:1" onclick="document.getElementById('delCustOv').remove();trashPut('cust',customers.find(x=>x.id===${cid}));customers=customers.filter(x=>x.id!==${cid});saveState();render()">确认删除</button>
     </div></div>`;
   document.body.appendChild(ov);
 }
 
+// 按货号(+批号)找产品：优先货号+客户批号都匹配，其次货号匹配且有库存，再其次货号匹配
+function findItemForLine(ln){
+  if(ln.iid){const d=items.find(i=>i.iid===ln.iid);if(d)return d;}
+  const k=String(ln.k||"").trim();if(!k)return null;
+  const cands=items.filter(i=>String(i.k||"").trim()===k);
+  if(!cands.length)return null;
+  const eb=String(ln.eb||"").trim();
+  return cands.find(i=>eb&&(i.eb===eb||i.b===eb))||cands.find(i=>(i.n||0)>0)||cands[0];
+}
+function snNo(){
+  const d=new Date(serverNow());const p=v=>String(v).padStart(2,"0");
+  return"SN"+d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds());
+}
 function doSaveSN(){
   syncSNDraft();
   if(!snDraft.to_name.trim())return alert("请填写收货人");
   if(!snDraft.lines.length||!snDraft.lines[0].k.trim())return alert("请填写至少一行产品货号");
-  const sn={id:snNextId++,no:"SN"+new Date().toISOString().replace(/[-:T]/g,"").slice(0,14),created:new Date().toLocaleString("zh-CN"),...snDraft};
+  const no=snNo();
+  const draft=Object.assign({},snDraft);
+  const ioUids=draft.ioUids||[];delete draft.ioUids;
+  const sn={id:snNextId++,sid:newUid("S"),no,created:nowStr(),dev:_devName,...draft};
+  // 库存扣减：每行生成一条出库记录（来自出库操作的首行已扣过，跳过）
+  const missing=[];const deducted=[];
+  if(sn.deduct){
+    sn.lines.forEach((ln,idx)=>{
+      if(sn.fromIO&&idx===0)return;
+      const d=findItemForLine(ln);const qt=roundQty(ln.qty);
+      if(!d||!qt){missing.push(ln.k||("第"+(idx+1)+"行"));return;}
+      const pv=roundQty(d.n),nx=roundQty(d.n-qt);
+      const uid=newUid();
+      d.logs.push({uid,tp:"out",qt,bt:d.b||"",dt:sn.ship_dt||todayStr(),pv,nx,eb:ln.eb||d.eb||"",nt:"出库单 "+no+" · "+sn.to_name,purpose:sn.purpose||"",sn:no,ts:serverNow(),dev:_devName});
+      recalcItem(d);ioUids.push(uid);deducted.push(d.s+" "+d.c+" ×"+fmtQty(qt)+(d.n<0?"（⚠ 库存变成 "+fmtQty(d.n)+"，可能有入库没登记）":""));
+    });
+  }
+  // 把出库记录和出库单互相关联（批次溯源）
+  ioUids.forEach(uid=>{items.forEach(d=>{const lg=(d.logs||[]).find(x=>x.uid===uid);if(lg){lg.sn=no;if(!lg.nt||lg.nt.indexOf("出库单")<0)lg.nt=(lg.nt?lg.nt+" · ":"")+"出库单 "+no;}});});
+  sn.logUids=ioUids;
   shipNotes.unshift(sn);
   upsertCustomer(sn); // 自动保存/更新客户档案
+  recalcCustomerOrders();
   snDraft=null;selId=sn.id;
   saveState();V="snview";render();
+  if(sn.deduct&&(deducted.length||missing.length)){
+    setTimeout(()=>{alert("出库单 "+no+" 已保存"+(deducted.length?"\n\n已扣减库存：\n"+deducted.join("\n"):"")+(missing.length?"\n\n⚠ 以下货号在库存里没找到对应产品，未扣减，请手动处理：\n"+missing.join("、"):""));},200);
+  }
 }
 function rSNList(){
   let h=`<div style="padding:16px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><div style="font-size:17px;font-weight:700;color:#fff">📋 出库单列表</div><button class="sm" style="background:#2563eb;padding:6px 14px" onclick="startNewSN()">+ 新建</button></div>`;
@@ -1772,7 +2282,9 @@ function rSNView(){
   h+=`<div><span style="color:#6b7280">外包装：</span><span style="color:#e5e7eb">${sn.pack}</span></div>`;
   h+=`</div>`;
   if(sn.note)h+=`<div style="font-size:11px;color:#9ca3af;margin-top:8px;white-space:pre-wrap">${sn.note}</div>`;
-  h+=`<div style="font-size:10px;color:#4b5563;margin-top:8px;border-top:1px solid #1e2130;padding-top:6px">创建时间: ${sn.created}</div></div>`;
+  const linked=(sn.logUids||[]).length;
+  h+=`<div style="font-size:11px;margin-top:8px;color:${linked?"#34d399":"#9ca3af"}">${linked?`✓ 已关联 ${linked} 条出库记录（库存已扣减）`:(sn.deduct===false&&!sn.fromIO?"○ 保存时未扣减库存（仅单据）":"")}${sn.purpose?` · 用途：${sn.purpose}`:""}</div>`;
+  h+=`<div style="font-size:10px;color:#4b5563;margin-top:8px;border-top:1px solid #1e2130;padding-top:6px">创建时间: ${sn.created}${sn.dev?" · "+sn.dev:""}</div></div>`;
   h+=`</div>`;return h;
 }
 function delSN(id){
@@ -1782,7 +2294,7 @@ function delSN(id){
     <div style="font-size:15px;font-weight:700;color:#f87171;margin-bottom:20px">确认删除此出库单？</div>
     <div style="display:flex;gap:10px">
       <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('delSnOv').remove()">取消</button>
-      <button class="btn" style="background:#dc2626;flex:1" onclick="document.getElementById('delSnOv').remove();shipNotes=shipNotes.filter(n=>n.id!==${id});saveState();V='snlist';render()">确认删除</button>
+      <button class="btn" style="background:#dc2626;flex:1" onclick="document.getElementById('delSnOv').remove();trashPut('sn',shipNotes.find(n=>n.id===${id}));shipNotes=shipNotes.filter(n=>n.id!==${id});saveState();V='snlist';render()">确认删除</button>
     </div>
   </div>`;
   document.body.appendChild(ov);
@@ -1851,7 +2363,7 @@ function updPrev(){document.getElementById("attPrev").textContent=window._fp+"/"
 function addAtt(id){
   const nm=document.getElementById("attNm").value.trim();if(!nm)return;
   const d=items.find(i=>i.id===id);
-  d.att.push({aid:Date.now(),tp:window._at.id,dir:window._at.dir,nm,dt:new Date().toISOString().slice(0,10)});
+  d.att.push({aid:serverNow(),tp:window._at.id,dir:window._at.dir,nm,dt:todayStr()});
   document.getElementById("attOv").remove();saveState();render();
 }
 function delAtt(id,aid){const d=items.find(i=>i.id===id);d.att=d.att.filter(a=>a.aid!==aid);saveState();render();}
@@ -1909,7 +2421,7 @@ function getPipeForm(){
 
 function doAddPipe(){
   const d=getPipeForm();if(!d)return;
-  pipe.push({id:nextPipeId++,...d});
+  pipe.push({id:nextPipeId++,pid:newUid("P"),...d});
   saveState();pipeEditId=null;render();
 }
 
@@ -1937,98 +2449,44 @@ function delPipe(id){
 }
 function confirmDelPipe(id){
   document.getElementById("delPipeOv").remove();
+  const p=pipe.find(x=>x.id===id);if(p)trashPut("pipe",p);
   pipe=pipe.filter(p=>p.id!==id);
   saveState();render();
 }
 
-function cyclePipe(pid){const p=pipe.find(x=>x.id===pid);if(!p)return;const c={"待启动":"进行中","进行中":"已完成","已完成":"待启动","待包装":"已完成"};p.st=c[p.st]||"进行中";render();}
+function cyclePipe(pid){const p=pipe.find(x=>x.id===pid);if(!p)return;const c={"待启动":"进行中","进行中":"已完成","已完成":"待启动","待包装":"已完成"};p.st=c[p.st]||"进行中";saveState();render();}
 
 // ═══ SYNC PAGE ═══
 async function saveSBConfigFromForm(){
   const url=document.getElementById("sbUrl").value.trim();
   const anonKey=document.getElementById("sbAnonKey").value.trim();
   if(!url||!anonKey){alert("请填写 Project URL 和 anon key");return;}
+  const nm=document.getElementById("sbDevName");
+  if(nm&&nm.value.trim()){_devName=nm.value.trim();saveSyncMeta();}
   const cfg={url,anonKey};
   saveSBConfig(cfg);
   const ok=await initSupabase(cfg);
   if(ok){
-    saveState();
-    alert("Supabase 连接成功！数据已同步到云端。");
+    alert("连接成功！\n产品 "+items.length+" 条 · 出库单 "+shipNotes.length+" 张 · 客户 "+customers.length+" 位\n之后所有改动都会自动同步，无需手动操作。");
     render();
   }else{
     localStorage.removeItem(SB_KEY);
     alert("连接失败，请检查配置信息，并确认已创建数据表。");
   }
 }
-// ═══ 云端版本快照 ═══
-// 用同一张表、不同的 data_key 存历史版本，无需改数据库结构。
-// 每次推送前，如果距上个快照超过 20 分钟，就把「当前云端内容」存为一个快照，
-// 这样任何一次覆盖都有前一版可回滚。最多保留 20 个。
-let _lastSnapAt=0;
-async function makeSnapshot(){
-  if(!sbClient||!sbConnected)return;
-  const now=Date.now();
-  if(now-_lastSnapAt<20*60*1000)return; // 20分钟内不重复快照
-  try{
-    // 取当前云端内容（还没被本次推送覆盖的版本）
-    const{data}=await sbClient.from("rigor_inventory").select("payload").eq("data_key","main").limit(1).single();
-    if(!data||!data.payload)return;
-    const p=typeof data.payload==="string"?JSON.parse(data.payload):data.payload;
-    if(!p||!p.items||!p.items.length)return;
-    const key="snap_"+now;
-    await sbClient.from("rigor_inventory").upsert({data_key:key,payload:p},{onConflict:"data_key"});
-    _lastSnapAt=now;
-    // 清理旧快照，只留最近 20 个
-    const{data:all}=await sbClient.from("rigor_inventory").select("data_key").like("data_key","snap_%");
-    if(all&&all.length>20){
-      const keys=all.map(r=>r.data_key).sort();
-      const del=keys.slice(0,all.length-20);
-      for(const k of del){try{await sbClient.from("rigor_inventory").delete().eq("data_key",k);}catch(e){}}
-    }
-  }catch(e){/* 快照失败不影响正常保存 */}
+function saveDevName(){
+  const el=document.getElementById("devNameInp");if(!el)return;
+  const v=el.value.trim();if(!v)return;
+  _devName=v;saveSyncMeta();heartbeat();
+  alert("已保存设备名称：「"+v+"」");
 }
 
-async function listSnapshots(){
-  if(!sbClient||!sbConnected)return[];
-  try{
-    const{data}=await sbClient.from("rigor_inventory").select("data_key,payload,updated_at").like("data_key","snap_%");
-    if(!data)return[];
-    return data.map(r=>{
-      const p=typeof r.payload==="string"?JSON.parse(r.payload):r.payload;
-      const its=p.items||[];
-      return{key:r.data_key,
-        at:parseInt(r.data_key.replace("snap_",""))||0,
-        items:its.length,
-        io:its.reduce((s,i)=>s+((i.logs&&i.logs.length)||0),0),
-        sn:(p.shipNotes||[]).length,
-        cust:(p.customers||[]).length,
-        stock:roundQty(its.reduce((s,i)=>s+(i.n||0),0))};
-    }).sort((a,b)=>b.at-a.at);
-  }catch(e){return[];}
-}
-
-async function restoreSnapshot(key){
-  if(!sbClient)return;
-  try{
-    const{data}=await sbClient.from("rigor_inventory").select("payload").eq("data_key",key).limit(1).single();
-    if(!data||!data.payload)return alert("该快照读取失败");
-    const p=typeof data.payload==="string"?JSON.parse(data.payload):data.payload;
-    if(!p||!p.items)return alert("该快照数据无效");
-    // 恢复前先把当前状态存成快照，防止误操作
-    _lastSnapAt=0;await makeSnapshot();
-    _syncedVer=_localVer;
-    applyCloudData(p);
-    _savedAt=Date.now();_localVer++;
-    await pushToCloud();
-    alert("已恢复到该版本\n产品 "+items.length+" 条 · 出库单 "+shipNotes.length+" 张 · 客户 "+customers.length+" 位");
-    render();
-  }catch(e){alert("恢复失败: "+e.message);}
-}
-
+// ═══ 云端版本历史 UI ═══
 function rSnapshots(){
   let h=`<div style="padding:16px"><button onclick="V='sync';render()" style="background:none;border:none;color:#6b7280;font-size:12px;cursor:pointer;margin-bottom:10px">← 返回同步页</button>`;
   h+=`<div style="font-size:17px;font-weight:700;color:#fff;margin-bottom:4px">🕐 云端版本历史</div>`;
-  h+=`<div style="font-size:11px;color:#6b7280;margin-bottom:14px">系统会在数据被覆盖前自动留存快照，可回滚到任意一版</div>`;
+  h+=`<div style="font-size:11px;color:#6b7280;margin-bottom:14px">系统每隔约 20 分钟自动留存整库快照（最多 30 份），可回滚到任意一版。回滚会以该版本覆盖云端并同步到所有电脑。</div>`;
+  h+=`<button class="sm" style="background:#1e3a5f;margin-bottom:12px" onclick="makeSnapshot().then(ok=>{alert(ok?'已生成快照':'快照失败');loadSnapUI();})">📸 立即生成一份快照</button>`;
   h+=`<div id="snapBody"><div style="text-align:center;padding:30px;color:#4b5563">读取中…</div></div></div>`;
   setTimeout(loadSnapUI,50);
   return h;
@@ -2036,11 +2494,12 @@ function rSnapshots(){
 async function loadSnapUI(){
   const el=document.getElementById("snapBody");if(!el)return;
   const list=await listSnapshots();
+  if(!document.getElementById("snapBody"))return;
   if(!list.length){el.innerHTML=`<div style="text-align:center;padding:30px;color:#4b5563">暂无历史快照<br><span style="font-size:12px">系统运行一段时间后会自动生成</span></div>`;return;}
   let h="";
   list.forEach(s=>{
     h+=`<div class="card" style="cursor:default">`;
-    h+=`<div style="font-size:13px;font-weight:600;color:#fff;margin-bottom:6px">${new Date(s.at).toLocaleString("zh-CN")}</div>`;
+    h+=`<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-size:13px;font-weight:600;color:#fff">${new Date(s.at).toLocaleString("zh-CN")}</span><span style="font-size:10px;color:#6b7280">${s.legacy?"旧版格式":(s.by?"来自 "+s.by:"")}</span></div>`;
     h+=`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;font-size:11px;text-align:center;margin-bottom:8px">`;
     h+=`<div><div style="font-size:16px;font-weight:700;color:#60a5fa">${s.items}</div><div style="color:#6b7280">产品</div></div>`;
     h+=`<div><div style="font-size:16px;font-weight:700;color:#fbbf24">${s.io}</div><div style="color:#6b7280">出入库</div></div>`;
@@ -2057,7 +2516,7 @@ function confirmRestoreSnap(key){
   ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
     <div style="font-size:40px;margin-bottom:12px">🕐</div>
     <div style="font-size:15px;font-weight:700;color:#fbbf24;margin-bottom:8px">恢复到这个版本？</div>
-    <div style="font-size:12px;color:#9ca3af;margin-bottom:20px">当前数据会先自动存为快照，可以再恢复回来</div>
+    <div style="font-size:12px;color:#9ca3af;margin-bottom:20px">当前数据会先自动存为快照，可以再恢复回来。<br>恢复后将覆盖云端，并同步到所有电脑。</div>
     <div style="display:flex;gap:10px">
       <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('rsOv').remove()">取消</button>
       <button class="btn" style="background:#2563eb;flex:1" onclick="document.getElementById('rsOv').remove();restoreSnapshot('${key}')">确认恢复</button>
@@ -2065,51 +2524,65 @@ function confirmRestoreSnap(key){
   document.body.appendChild(ov);
 }
 
-// 手动解决数据冲突
-async function forcePush(){
-  if(!sbConnected)return alert("未连接云数据库");
-  _savedAt=Date.now();_localVer++;
-  await pushToCloud();
-  alert("已用本机数据覆盖云端\n产品 "+items.length+" 条 · 出库单 "+shipNotes.length+" 张 · 客户 "+customers.length+" 位");
-  render();
+// ═══ 回收站 UI ═══
+function rTrash(){
+  const t=trashList();
+  let h=`<div style="padding:16px"><button onclick="V='sync';render()" style="background:none;border:none;color:#6b7280;font-size:12px;cursor:pointer;margin-bottom:10px">← 返回同步页</button>`;
+  h+=`<div style="font-size:17px;font-weight:700;color:#fff;margin-bottom:4px">🗑️ 回收站（本机）</div>`;
+  h+=`<div style="font-size:11px;color:#6b7280;margin-bottom:14px">在任意电脑上删除的产品/出库单/客户/研发项目，这台电脑都会留一份副本（最多 60 条），误删可一键找回</div>`;
+  if(!t.length){h+=`<div style="text-align:center;padding:30px;color:#4b5563">回收站是空的</div></div>`;return h;}
+  const tn={item:"产品",sn:"出库单",cust:"客户",pipe:"研发项目"};
+  t.forEach((e,i)=>{
+    const o=e.obj||{};
+    let title="";
+    if(e.type==="item")title=`${o.s||""} ${o.c||""} ${o.f&&o.f!=="无"?o.f:""} · ${o.k||o.m||""} · 库存 ${fmtQty(o.n)} · 记录 ${(o.logs||[]).length} 条`;
+    else if(e.type==="sn")title=`${o.no||""} · ${o.to_name||""} · ${(o.lines||[]).length} 项`;
+    else if(e.type==="cust")title=`${o.name||""} · ${o.phone||""}`;
+    else title=o.nm||"";
+    h+=`<div class="card" style="cursor:default;display:flex;align-items:center;gap:10px"><div style="flex:1;min-width:0"><div style="font-size:11px;color:#f87171">${tn[e.type]||e.type} · 删除于 ${new Date(e.at).toLocaleString("zh-CN")}</div><div style="font-size:13px;color:#e5e7eb;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${title}</div></div><button class="sm" style="background:#059669" onclick="trashRestore(${i})">找回</button></div>`;
+  });
+  h+=`</div>`;return h;
 }
-function forcePull(){
+
+// ═══ 手动覆盖（仅在数据严重不一致时使用）═══
+function forcePush(){
   if(!sbConnected)return alert("未连接云数据库");
   const ov=document.createElement("div");ov.className="overlay";ov.id="fpOv";
   ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
     <div style="font-size:40px;margin-bottom:12px">⚠️</div>
-    <div style="font-size:15px;font-weight:700;color:#f87171;margin-bottom:8px">用云端数据覆盖本机？</div>
-    <div style="font-size:12px;color:#9ca3af;margin-bottom:20px">本机未上传的改动将丢失，确认云端数据是最新的再操作</div>
+    <div style="font-size:15px;font-weight:700;color:#fbbf24;margin-bottom:8px">用本机数据覆盖云端？</div>
+    <div style="font-size:12px;color:#9ca3af;margin-bottom:20px;line-height:1.7">云端所有记录将以本机为准：本机没有的产品/出库单/客户会从云端删除。<br>其他电脑几秒后会自动变成本机的数据。<br><b style="color:#f87171">正常情况下不需要这个操作</b>，系统会自动合并双方改动。</div>
     <div style="display:flex;gap:10px">
       <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('fpOv').remove()">取消</button>
-      <button class="btn" style="background:#dc2626;flex:1" onclick="doForcePull()">确认覆盖</button>
+      <button class="btn" style="background:#b45309;flex:1" onclick="document.getElementById('fpOv').remove();forcePushAll().then(()=>{alert('已用本机数据覆盖云端\\n产品 '+items.length+' 条 · 出库单 '+shipNotes.length+' 张 · 客户 '+customers.length+' 位');render();})">确认覆盖云端</button>
     </div></div>`;
   document.body.appendChild(ov);
 }
-async function doForcePull(){
-  document.getElementById("fpOv").remove();
-  _syncedVer=_localVer; // 清除脏标记，允许拉取
-  try{
-    const{data}=await sbClient.from("rigor_inventory").select("payload,updated_at").eq("data_key","main").limit(1).single();
-    if(data&&data.payload){
-      const d=typeof data.payload==="string"?JSON.parse(data.payload):data.payload;
-      if(d&&d.items){_lastSbUpdate=data.updated_at;applyCloudData(d);
-        alert("已从云端拉取\n产品 "+items.length+" 条 · 出库单 "+shipNotes.length+" 张 · 客户 "+customers.length+" 位");
-        return;}
-    }
-    alert("云端暂无数据");
-  }catch(e){alert("拉取失败: "+e.message);}
+function forcePull(){
+  if(!sbConnected)return alert("未连接云数据库");
+  const pend=computePending().length;
+  const ov=document.createElement("div");ov.className="overlay";ov.id="fpOv";
+  ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
+    <div style="font-size:40px;margin-bottom:12px">⚠️</div>
+    <div style="font-size:15px;font-weight:700;color:#f87171;margin-bottom:8px">用云端数据覆盖本机？</div>
+    <div style="font-size:12px;color:#9ca3af;margin-bottom:20px;line-height:1.7">本机将丢弃全部数据并重新从云端下载。${pend?`<br><b style="color:#fbbf24">本机还有 ${pend} 条改动没上传，将会丢失！</b>`:"<br>本机没有未上传的改动。"}</div>
+    <div style="display:flex;gap:10px">
+      <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('fpOv').remove()">取消</button>
+      <button class="btn" style="background:#dc2626;flex:1" onclick="document.getElementById('fpOv').remove();forcePullAll().then(()=>{alert('已从云端重新下载\\n产品 '+items.length+' 条 · 出库单 '+shipNotes.length+' 张 · 客户 '+customers.length+' 位');render();})">确认覆盖本机</button>
+    </div></div>`;
+  document.body.appendChild(ov);
 }
 
 function disconnectSB(){
+  const pend=sbConnected?computePending().length:0;
   const ov=document.createElement("div");ov.className="overlay";ov.id="discOv";
   ov.innerHTML=`<div class="modal" style="text-align:center;padding:30px">
     <div style="font-size:40px;margin-bottom:12px">🔌</div>
     <div style="font-size:15px;font-weight:700;color:#fff;margin-bottom:8px">断开云同步？</div>
-    <div style="font-size:13px;color:#9ca3af;margin-bottom:20px">数据仍保留在本地浏览器中</div>
+    <div style="font-size:13px;color:#9ca3af;margin-bottom:20px;line-height:1.7">断开后本机登记的内容只存在这台电脑上，别人看不到。${pend?`<br><b style="color:#fbbf24">本机还有 ${pend} 条改动没上传。</b>`:""}<br><b style="color:#34d399">提示：</b>网络不好时不需要断开，系统会自动在联网后补传。</div>
     <div style="display:flex;gap:10px">
       <button class="btn" style="background:#374151;flex:1" onclick="document.getElementById('discOv').remove()">取消</button>
-      <button class="btn" style="background:#f59e0b;flex:1" onclick="confirmDisconnect()">确认断开</button>
+      <button class="btn" style="background:#f59e0b;flex:1" onclick="confirmDisconnect()">仍要断开</button>
     </div>
   </div>`;
   document.body.appendChild(ov);
@@ -2118,28 +2591,30 @@ function confirmDisconnect(){
   document.getElementById("discOv").remove();
   localStorage.removeItem(SB_KEY);
   if(sbPollTimer)clearInterval(sbPollTimer);
-  sbConnected=false;sbClient=null;
-  render();
+  if(_hbTimer)clearInterval(_hbTimer);
+  clearTimeout(_pushTimer);_pushTimer=null;
+  sbConnected=false;sbClient=null;_devices={};
+  updateStatus();render();
 }
 
 // ═══ 出库统计 STATS MODULE ═══
 function rStats(){
-  const now=new Date();
-  const todayStr=now.toISOString().slice(0,10);
-  const weekAgo=new Date(now-7*864e5).toISOString().slice(0,10);
-  const monthStart=now.toISOString().slice(0,7)+"-01";
+  const nowMs=serverNow();const now=new Date(nowMs);
+  const todayS=todayStr();
+  const weekAgo=fmtDate(nowMs-7*864e5);
+  const monthStart=todayS.slice(0,7)+"-01";
   const yearStart=now.getFullYear()+"-01-01";
 
-  // Collect all outbound logs from all items
+  // Collect all outbound logs from all items（盘点调整不算出库）
   const outLogs=[];
   items.forEach(d=>{
     (d.logs||[]).forEach(lg=>{
-      if(lg.tp==="out"&&lg.dt){outLogs.push({...lg,item:d});}
+      if(lg.tp==="out"&&lg.dt&&!lg.adj){outLogs.push({...lg,item:d});}
     });
   });
 
   // Time period stats
-  const todayOut=outLogs.filter(l=>l.dt===todayStr);
+  const todayOut=outLogs.filter(l=>l.dt===todayS);
   const weekOut=outLogs.filter(l=>l.dt>=weekAgo);
   const monthOut=outLogs.filter(l=>l.dt>=monthStart);
   const yearOut=outLogs.filter(l=>l.dt>=yearStart);
@@ -2249,19 +2724,39 @@ function rStats(){
 }
 
 function rSync(){
-  const dataSize=(JSON.stringify({items,logs:allLogs,pipe}).length/1024).toFixed(1);
   const hasSB=!!getSBConfig();
+  const ioCnt=items.reduce((s,i)=>s+((i.logs&&i.logs.length)||0),0);
+  const dataSize=(JSON.stringify({items,pipe,shipNotes,customers}).length/1024).toFixed(0);
   let h=`<div style="padding:16px"><div style="font-size:17px;font-weight:700;color:#fff;margin-bottom:4px">☁ 数据同步</div>`;
-  h+=`<div style="font-size:11px;color:#6b7280;margin-bottom:16px">Supabase 云同步 · 国内可用 · 多人协同</div>`;
+  h+=`<div style="font-size:11px;color:#6b7280;margin-bottom:16px">Supabase 云同步 v3 · 按记录同步 · 国内可用 · 多人协同</div>`;
 
-  // Connection status
-  h+=`<div class="card" style="cursor:default;border-color:${sbConnected?"#059669":"#2a2e3e"}"><div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><div style="width:10px;height:10px;border-radius:50%;background:${sbConnected?"#34d399":"#6b7280"};${sbConnected?"box-shadow:0 0 8px #34d39980;":""}"></div><span style="font-size:13px;font-weight:600;color:${sbConnected?"#34d399":"#9ca3af"}">${sbConnected?"☁ Supabase 已连接 · 每5秒自动同步":"未连接云数据库"}</span></div>`;
-  h+=`<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;font-size:11px;text-align:center">`;
-  h+=`<div><div style="font-size:18px;font-weight:700;color:#fff">${items.length}</div><div style="color:#6b7280">产品</div></div>`;
-  h+=`<div><div style="font-size:18px;font-weight:700;color:#fff">${pipe.length}</div><div style="color:#6b7280">研发项目</div></div>`;
-  h+=`<div><div style="font-size:18px;font-weight:700;color:#fff">${allLogs.length}</div><div style="color:#6b7280">操作记录</div></div>`;
+  // ── 连接状态 ──
+  const pend=sbConnected?_pendingCount:0;
+  const stColor=!sbConnected?"#6b7280":_lastErr?"#f87171":pend>0?"#fbbf24":"#34d399";
+  const stText=!sbConnected?(hasSB?"连接中…":"未连接云数据库"):_lastErr?"网络异常，自动重试中":pend>0?`正在上传 ${pend} 条改动`:"已连接 · 全部已同步";
+  h+=`<div class="card" style="cursor:default;border-color:${sbConnected?"#059669":"#2a2e3e"}"><div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><div style="width:10px;height:10px;border-radius:50%;background:${stColor};${sbConnected&&!_lastErr?"box-shadow:0 0 8px "+stColor+"80;":""}"></div><span style="font-size:13px;font-weight:600;color:${stColor}">${stText}</span></div>`;
+  h+=`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;font-size:11px;text-align:center;margin-bottom:10px">`;
+  h+=`<div><div style="font-size:18px;font-weight:700;color:#60a5fa">${items.length}</div><div style="color:#6b7280">产品</div></div>`;
+  h+=`<div><div style="font-size:18px;font-weight:700;color:#fbbf24">${ioCnt}</div><div style="color:#6b7280">出入库记录</div></div>`;
+  h+=`<div><div style="font-size:18px;font-weight:700;color:#34d399">${shipNotes.length}</div><div style="color:#6b7280">出库单</div></div>`;
+  h+=`<div><div style="font-size:18px;font-weight:700;color:#c084fc">${customers.length}</div><div style="color:#6b7280">客户</div></div>`;
   h+=`</div>`;
-  h+=`<div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e2130;font-size:10px;color:#6b7280">上次同步: ${lastSync||"尚未保存"} · ${dataSize} KB<br>程序版本: ${APP_VER}</div></div>`;
+  if(sbConnected){
+    const others=Object.keys(_devices).map(k=>_devices[k]);
+    const now=serverNow();
+    h+=`<div style="font-size:11px;color:#9ca3af;line-height:1.9;border-top:1px solid #1e2130;padding-top:8px">`;
+    h+=`<div>本机：<span style="color:#e5e7eb">${_devName}</span>　上次上传 ${_lastPushAt?new Date(_lastPushAt).toLocaleTimeString("zh-CN"):"—"}　上次拉取 ${_lastPullAt?new Date(_lastPullAt).toLocaleTimeString("zh-CN"):"—"}</div>`;
+    if(others.length){
+      h+=`<div>其他电脑：`+others.map(d=>{const on=now-tsNum(d._ts)<95000;const ago=Math.max(0,Math.round((now-tsNum(d._ts))/60000));return`<span style="color:${on?"#34d399":"#6b7280"}">${on?"● ":"○ "}${d.name||"未命名"}${d.ver&&d.ver!==APP_VER?` <span style="color:#fbbf24">(旧版本，请 Ctrl+F5)</span>`:""}${on?" 在线":(ago<60?` ${ago} 分钟前`:ago<1440?` ${Math.round(ago/60)} 小时前`:` ${Math.round(ago/1440)} 天前`)}${d.pend?` <span style="color:#fbbf24">(有 ${d.pend} 条待传)</span>`:""}</span>`;}).join("　")+`</div>`;
+    }else h+=`<div style="color:#4b5563">还没有其他电脑连接过</div>`;
+    if(_clockChecked){const off=Math.round(_clockOff/1000);h+=`<div>本机时钟：${Math.abs(off)<120?`<span style="color:#34d399">正常</span>`:Math.abs(off)<6*3600?`<span style="color:#fbbf24">偏差 ${Math.round(Math.abs(off)/60)} 分钟</span>`:`<span style="color:#f87171">偏差 ${(Math.abs(off)/86400).toFixed(1)} 天，请修正电脑时间</span>`}</div>`;}
+    if(_lastErr)h+=`<div style="color:#f87171">最近错误：${String(_lastErr).slice(0,120)}</div>`;
+    h+=`<div style="color:#4b5563">程序版本：${APP_VER}</div>`;
+    h+=`</div>`;
+  }else{
+    h+=`<div style="font-size:10px;color:#6b7280;border-top:1px solid #1e2130;padding-top:8px">本机数据 ${dataSize} KB · 上次保存 ${lastSync||"—"}<br>程序版本：${APP_VER}</div>`;
+  }
+  h+=`</div>`;
 
   // 货号更正（2026-10-04）
   try{
@@ -2280,16 +2775,16 @@ function rSync(){
     h+=`<div style="font-size:11px;color:#9ca3af;line-height:1.8;margin-bottom:12px">`;
     h+=`<div style="margin-bottom:8px"><span style="color:#fbbf24;font-weight:600">Step 1</span> 打开 <span style="color:#60a5fa">supabase.com</span> → 用 GitHub 账号登录（免费）</div>`;
     h+=`<div style="margin-bottom:8px"><span style="color:#fbbf24;font-weight:600">Step 2</span> New Project → 名称填 <span style="color:#34d399">rigor-inventory</span> → 设密码 → Create</div>`;
-    h+=`<div style="margin-bottom:8px"><span style="color:#fbbf24;font-weight:600">Step 3</span> 左侧 <span style="color:#60a5fa">SQL Editor</span> → 粘贴下面的建表语句 → 点 <span style="color:#34d399">Run</span></div>`;
+    h+=`<div style="margin-bottom:8px"><span style="color:#fbbf24;font-weight:600">Step 3</span> 左侧 <span style="color:#60a5fa">SQL Editor</span> → 粘贴下面的建表语句 → 点 <span style="color:#34d399">Run</span>（已建过表的直接跳到 Step 4）</div>`;
     h+=`</div>`;
-    h+=`<div style="background:#0d1117;border:1px solid #1e2130;border-radius:8px;padding:12px;margin-bottom:12px;font-family:monospace;font-size:11px;color:#7dd3fc;white-space:pre-wrap;word-break:break-all;user-select:all">create table rigor_inventory (
+    h+=`<div style="background:#0d1117;border:1px solid #1e2130;border-radius:8px;padding:12px;margin-bottom:12px;font-family:monospace;font-size:11px;color:#7dd3fc;white-space:pre-wrap;word-break:break-all;user-select:all">create table if not exists rigor_inventory (
   id bigint generated always as identity primary key,
   data_key text unique not null default 'main',
   payload jsonb,
   updated_at timestamptz default now()
 );
 
--- 自动更新时间戳
+-- 自动更新时间戳（服务器时间）
 create or replace function update_timestamp()
 returns trigger as $$
 begin
@@ -2298,27 +2793,41 @@ begin
 end;
 $$ language plpgsql;
 
+drop trigger if exists set_timestamp on rigor_inventory;
 create trigger set_timestamp
   before update on rigor_inventory
   for each row execute function update_timestamp();
 
+-- 增量同步用的索引
+create index if not exists rigor_inventory_updated_idx on rigor_inventory(updated_at);
+
 -- 开放读写权限
 alter table rigor_inventory enable row level security;
+drop policy if exists "Allow all" on rigor_inventory;
 create policy "Allow all" on rigor_inventory for all using (true) with check (true);</div>`;
     h+=`<div style="font-size:11px;color:#9ca3af;line-height:1.8;margin-bottom:12px">`;
     h+=`<div><span style="color:#fbbf24;font-weight:600">Step 4</span> 左侧 <span style="color:#60a5fa">Project Settings → API</span> → 复制下面两个值</div>`;
     h+=`</div>`;
     h+=`<div class="form-row"><div class="form-label">Project URL *</div><input class="inp" id="sbUrl" placeholder="如 https://xxxx.supabase.co"></div>`;
     h+=`<div class="form-row"><div class="form-label">anon public key *</div><input class="inp" id="sbAnonKey" placeholder="粘贴 anon key（很长的一串）"></div>`;
+    h+=`<div class="form-row"><div class="form-label">这台电脑的名称（方便区分是谁在操作）</div><input class="inp" id="sbDevName" value="${_devName}" placeholder="如：老板电脑 / 小王电脑"></div>`;
     h+=`<button class="btn" style="background:#34d399;color:#000" onclick="saveSBConfigFromForm()">连接 Supabase</button></div>`;
   } else {
-    h+=`<div class="card" style="cursor:default;border-color:#059669"><div style="font-size:13px;font-weight:600;color:#34d399;margin-bottom:8px">✅ Supabase 已配置</div>`;
-    h+=`<div style="font-size:11px;color:#9ca3af;margin-bottom:6px">你和同事打开同一个网址，数据每5秒自动同步。一方修改，另一方几秒后自动看到。</div>`;
-    h+=`<div style="font-size:10px;color:#6b7280;margin-bottom:10px;padding:6px 8px;background:#111318;border-radius:6px">${getSBConfig().url||"—"}</div>`;
-    h+=`<div style="display:flex;gap:8px;margin-bottom:8px"><button class="btn" style="background:#059669;flex:1" onclick="forcePush()">⬆ 本地覆盖云端</button><button class="btn" style="background:#1e3a5f;flex:1" onclick="forcePull()">⬇ 云端覆盖本地</button></div>`;
-    h+=`<div style="font-size:10px;color:#4b5563;margin-bottom:8px;padding:6px;background:#111318;border-radius:6px">数据对不上时用这两个按钮手动解决：确认本机数据是最新的就点「本地覆盖云端」，反之点「云端覆盖本地」</div>`;
-    h+=`<button class="btn" style="background:#4c1d95;margin-bottom:8px" onclick="V='snap';render()">🕐 查看云端版本历史 / 回滚</button>`;
-    h+=`<button class="btn" style="background:#374151" onclick="disconnectSB()">断开连接</button></div>`;
+    h+=`<div class="card" style="cursor:default;border-color:#059669"><div style="font-size:13px;font-weight:600;color:#34d399;margin-bottom:8px">✅ 云同步工作方式</div>`;
+    h+=`<div style="font-size:11px;color:#9ca3af;line-height:1.9;margin-bottom:10px">`;
+    h+=`<div>· 每一条产品、出入库记录、出库单、客户都<b style="color:#e5e7eb">单独同步</b>，两台电脑同时操作互不覆盖</div>`;
+    h+=`<div>· 库存数 = 基数 + 全部出入库记录，双方各自登记的记录合并后结果一致</div>`;
+    h+=`<div>· 断网/关机时登记的内容记在本机，<b style="color:#e5e7eb">联网后自动补传</b>，不需要手动断开再连接</div>`;
+    h+=`<div>· 别人的改动每 5 秒自动拉取；正在填表时不会打断，填完自动刷新</div>`;
+    h+=`</div>`;
+    h+=`<div style="font-size:10px;color:#6b7280;margin-bottom:10px;padding:6px 8px;background:#111318;border-radius:6px;word-break:break-all">${getSBConfig().url||"—"}</div>`;
+    h+=`<div class="form-row"><div class="form-label">这台电脑的名称</div><div style="display:flex;gap:8px"><input class="inp" id="devNameInp" value="${_devName}" style="flex:1"><button class="sm" style="background:#374151" onclick="saveDevName()">保存</button></div></div>`;
+    h+=`<div style="display:flex;gap:8px;margin-bottom:8px"><button class="btn" style="background:#059669;flex:1" onclick="manualSync().then(()=>{alert('同步完成\\n待上传 '+_pendingCount+' 条');render();})">🔄 立即同步</button><button class="btn" style="background:#1e3a5f;flex:1" onclick="verifyCloud()">🔍 云端校验</button></div>`;
+    h+=`<div style="display:flex;gap:8px;margin-bottom:8px"><button class="btn" style="background:#4c1d95;flex:1" onclick="V='snap';render()">🕐 版本历史 / 回滚</button><button class="btn" style="background:#374151;flex:1" onclick="V='trash';render()">🗑️ 回收站 (${trashList().length})</button></div>`;
+    h+=`<details style="margin-top:6px"><summary style="font-size:11px;color:#6b7280;cursor:pointer;padding:4px 0">高级操作（数据严重不一致时才用）</summary>`;
+    h+=`<div style="display:flex;gap:8px;margin:8px 0"><button class="btn" style="background:#78350f;flex:1;padding:8px" onclick="forcePush()">⬆ 本机覆盖云端</button><button class="btn" style="background:#7f1d1d;flex:1;padding:8px" onclick="forcePull()">⬇ 云端覆盖本机</button></div>`;
+    h+=`<div style="font-size:10px;color:#4b5563;margin-bottom:8px;padding:6px;background:#111318;border-radius:6px">正常情况下系统会自动合并双方改动，不需要这两个按钮。只有在确认某一边的数据完全正确、要以它为准时才使用。</div>`;
+    h+=`<button class="btn" style="background:#374151;padding:8px" onclick="disconnectSB()">断开连接</button></details></div>`;
   }
 
   // Password management
@@ -2328,10 +2837,13 @@ create policy "Allow all" on rigor_inventory for all using (true) with check (tr
 
   h+=`<div class="card" style="cursor:default"><div style="font-size:13px;font-weight:600;color:#9ca3af;margin-bottom:8px">💾 备份 & 恢复</div>`;
   h+=`<div style="display:flex;gap:8px;margin-bottom:8px"><button class="btn" style="background:#1e3a5f;flex:1" onclick="exportData()">📤 导出 JSON</button><button class="btn" style="background:#1e2130;border:1px solid #2a2e3e;flex:1" onclick="importData()">📥 导入 JSON</button></div>`;
-  h+=`<button class="btn" style="background:#5c1a1a;margin-top:4px" onclick="resetToDefault()">⚠️ 恢复初始数据</button></div>`;
+  h+=`<button class="btn" style="background:#5c1a1a;margin-top:4px" onclick="resetToDefault()">🧹 清空本机数据（云端不受影响）</button></div>`;
 
   h+=`</div>`;return h;
 }
 
 render();
+updateStatus();
+// 启动时自动连接云端（放在最后，确保所有变量都已初始化）
+(function(){const cfg=getSBConfig();if(cfg)initSupabase(cfg);})();
 </script></body></html>
